@@ -1,0 +1,15 @@
+{
+  "total_real": 38582,
+  "total_fake": 31249,
+  "train_real": 27007,
+  "train_fake": 21874,
+  "val_real": 5787,
+  "val_fake": 4687,
+  "test_real": 5788,
+  "test_fake": 4688,
+  "ratios": {
+    "train": 0.7,
+    "val": 0.15,
+    "test": 0.15
+  }
+}
