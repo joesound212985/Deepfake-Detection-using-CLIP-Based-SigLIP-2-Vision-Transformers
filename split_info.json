@@ -1,26 +1,15 @@
 {
-  "dataset_type": "video",
-  "source_directories": {
-    "real": "/mnt/c/Users/admin/Desktop/Real-vid/",
-    "fake": "/mnt/c/Users/admin/Desktop/Fake-vid/"
-  },
-  "split_ratios": {
+  "total_real": 38582,
+  "total_fake": 31249,
+  "train_real": 27007,
+  "train_fake": 21874,
+  "val_real": 5787,
+  "val_fake": 4687,
+  "test_real": 5788,
+  "test_fake": 4688,
+  "ratios": {
     "train": 0.7,
     "val": 0.15,
     "test": 0.15
-  },
-  "split_counts": {
-    "train_real": 3052,
-    "train_fake": 3052,
-    "val_real": 654,
-    "val_fake": 654,
-    "test_real": 655,
-    "test_fake": 655,
-    "total_real": 4361,
-    "total_fake": 4361,
-    "total_videos": 8722
-  },
-  "video_extensions_found": [
-    ".mp4"
-  ]
+  }
 }
