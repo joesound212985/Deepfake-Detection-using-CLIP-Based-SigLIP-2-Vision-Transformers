@@ -1,6 +1,14 @@
 import os, io, math, numpy as np, torch, torch.nn as nn
 import pywt
 import cv2
+from scipy.ndimage import gaussian_filter
+from scipy.fftpack import dct
+from matplotlib.colors import LogNorm
+try:
+    from skimage.feature import greycomatrix, greycoprops
+except Exception:
+    greycomatrix = None
+    greycoprops = None
 from PIL import Image, ImageOps, ImageFile
 from torchvision import transforms
 try:
@@ -8,6 +16,11 @@ try:
 except ImportError:
     from huggingface_hub import hf_hub_download, login
     InferenceClient = None
+try:
+    # OpenAI-compatible client for Hugging Face router
+    from openai import OpenAI as _OpenAIClient
+except Exception:
+    _OpenAIClient = None
 try:
     import requests
 except Exception:
@@ -57,6 +70,8 @@ matplotlib.use("Agg", force=True)
 torch.set_grad_enabled(False)
 torch.set_num_threads(2)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+# Allow safely handling very large images (up to ~300M pixels)
+Image.MAX_IMAGE_PIXELS = 300_000_000
 
 # ============================================================
 #       PATCH GRADIO CLIENT JSON-SCHEMA BUG (optional)
@@ -104,17 +119,22 @@ else:
 #           OPTIONAL LLM EXPLANATION (DeepSeek R1)
 # ============================================================
 
-HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+# Default LLM model for explanations.
+# For the HF router + OpenAI-compatible client, use the ":novita" suffix.
+HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "deepseek-ai/DeepSeek-R1:novita")
+HF_LLM_BASE_URL = os.getenv("HF_LLM_BASE_URL", "https://router.huggingface.co/v1")
 
-if InferenceClient is not None:
+_openai_llm_client = None
+if _OpenAIClient is not None and HF_TOKEN:
     try:
-        _deepseek_client = InferenceClient(model=HF_LLM_MODEL, token=HF_TOKEN)
-        print(f"[llm] DeepSeek client initialized for model: {HF_LLM_MODEL}")
+        _openai_llm_client = _OpenAIClient(
+            base_url=HF_LLM_BASE_URL,
+            api_key=HF_TOKEN,
+        )
+        print(f"[llm] OpenAI-compatible HF router client initialized for model: {HF_LLM_MODEL}")
     except Exception as _e:
-        _deepseek_client = None
-        print(f"[llm] Failed to init DeepSeek client: {_e.__class__.__name__}")
-else:
-    _deepseek_client = None
+        _openai_llm_client = None
+        print(f"[llm] Failed to init OpenAI router client: {_e.__class__.__name__}")
 
 
 def explain_with_deepseek(metrics: dict) -> str:
@@ -122,8 +142,9 @@ def explain_with_deepseek(metrics: dict) -> str:
     Use DeepSeek-R1-Distill-Qwen-7B (or compatible HF LLM)
     to generate a short, human-readable explanation of the
     detector metrics.
+    Uses the HF router via an OpenAI-compatible client when available.
     """
-    if _deepseek_client is None:
+    if _openai_llm_client is None:
         return (
             "Automatic explanation disabled or unavailable. "
             "The numeric forensic scores above are still valid."
@@ -138,65 +159,18 @@ Be concise, avoid math formulas, and reference only the most important signals.
 Here are the metrics (keys are feature names):
 {metrics}
 """
-
-    # Prefer InferenceClient.conversational if available and compatible
     try:
-        if hasattr(_deepseek_client, "conversational"):
-            raw = _deepseek_client.conversational(prompt)
-        else:
-            # Fallback: call HF Inference API directly for conversational task
-            if requests is None or HF_TOKEN is None:
-                raise RuntimeError("requests or HF_TOKEN not available for LLM call")
-
-            api_url = f"https://api-inference.huggingface.co/models/{HF_LLM_MODEL}"
-            payload = {
-                "inputs": {
-                    "past_user_inputs": [],
-                    "generated_responses": [],
-                    "text": prompt,
-                }
-            }
-            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-            resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            raw = resp.json()
+        resp = _openai_llm_client.chat.completions.create(
+            model=HF_LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.choices[0].message.content if resp.choices else ""
     except Exception as e:
-        print(f"[llm] DeepSeek explanation error: {e}")
+        print(f"[llm] HF router explanation error: {e}")
         return (
-            f"Automatic explanation unavailable (LLM error: {e.__class__.__name__}). "
+            "Automatic explanation unavailable (LLM backend unreachable or misconfigured). "
             "Please rely on the numeric scores above."
         )
-
-    # Try to extract a string response from the conversational payload
-    text = ""
-    try:
-        if isinstance(raw, str):
-            text = raw
-        elif isinstance(raw, dict):
-            if "generated_text" in raw:
-                text = str(raw["generated_text"])
-            elif "conversation" in raw and isinstance(raw["conversation"], dict):
-                conv = raw["conversation"]
-                if isinstance(conv.get("generated_responses"), list) and conv["generated_responses"]:
-                    text = str(conv["generated_responses"][-1])
-                elif "generated_text" in conv:
-                    text = str(conv["generated_text"])
-                else:
-                    text = _json.dumps(raw)
-            else:
-                text = _json.dumps(raw)
-        elif isinstance(raw, list) and raw:
-            item = raw[-1]
-            if isinstance(item, str):
-                text = item
-            elif isinstance(item, dict) and "generated_text" in item:
-                text = str(item["generated_text"])
-            else:
-                text = _json.dumps(raw)
-        else:
-            text = str(raw)
-    except Exception:
-        text = str(raw)
 
     # Strip DeepSeek-R1-style hidden reasoning, if present
     if "</think>" in text:
@@ -261,6 +235,9 @@ CORAL_CUTS, CORAL_TEMP, CORAL_BINS = load_coral()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FREQ_DEVICE = "cpu"   # keeps frequency MLP cheap
 
+# SigLIP WebLI backbone is trained at 384px and the open_clip
+# model enforces this input size; keep IMG_SIZE=384 to avoid
+# patch_embed assertion errors.
 IMG_SIZE = 384
 EPS = 1e-8
 
@@ -892,18 +869,315 @@ def benford_wavelet_score(img_np: np.ndarray) -> float:
     d_HH = benford_distance(HH)
     return float((d_LH + d_HL + d_HH) / 3.0)
 
-def extract_prnu(img_np: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    denoised_u8 = cv2.fastNlMeansDenoising(gray.astype(np.uint8), None, 10, 7, 21)
-    denoised = denoised_u8.astype(np.float32)
-    residual = gray - denoised
-    hp = residual - cv2.GaussianBlur(residual, ksize=(0,0), sigmaX=3)
-    hp = hp / (np.std(hp) + 1e-6)
-    return hp
+def extract_prnu(image: np.ndarray, sigma: float = 3.0) -> np.ndarray:
+    """
+    Extract PRNU sensor noise from a BGR or RGB image.
+    Returns a 2D float32 map, zero-mean, unit-ish variance.
+    """
+    if image.dtype != np.float32:
+        img = image.astype(np.float32) / 255.0
+    else:
+        img = image.copy()
+
+    # Convert to grayscale (PRNU is luminance-dominant)
+    if img.ndim == 3:
+        # img_np in this app is RGB; if BGR is passed, the effect is minor
+        gray_u8 = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        gray = gray_u8.astype(np.float32) / 255.0
+    else:
+        gray = img
+
+    # Wavelet-like denoising via Gaussian smoothing
+    smooth = gaussian_filter(gray, sigma)
+    noise = gray - smooth
+    noise -= float(noise.mean())
+    noise /= (float(noise.std()) + 1e-8)
+    return noise.astype(np.float32)
 
 def prnu_consistency_score(img_np: np.ndarray) -> float:
     prnu = extract_prnu(img_np)
     return float(np.var(prnu.flatten()))
+
+
+def prnu_strength(noise: np.ndarray) -> float:
+    """
+    Scalar PRNU strength; real sensors show stable non-zero values.
+    """
+    return float(np.mean(np.abs(noise)))
+
+
+def jpeg_block_consistency(img_np: np.ndarray) -> float:
+    """JPEG 8x8 block variance consistency; higher → more real."""
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    blk = []
+    for y in range(0, h - 8, 8):
+        for x in range(0, w - 8, 8):
+            patch = gray[y:y+8, x:x+8].astype(np.float32)
+            blk.append(float(np.var(patch)))
+    if not blk:
+        return 0.0
+    blk = np.array(blk, dtype=np.float32)
+    return float(1.0 - min(np.std(blk) / 50.0, 1.0))
+
+
+def highlight_clipping_realness(img_np: np.ndarray) -> float:
+    """Highlight clipping prior; higher → more real."""
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    bright = np.mean(gray > 245)
+    return float(min(bright / 0.05, 1.0))
+
+
+def crop_consistency_score(pil: Image.Image) -> float:
+    """Random crop variance stability; higher → more real."""
+    img = np.asarray(pil)
+    h, w, _ = img.shape
+    if h < 4 or w < 4:
+        return 0.0
+    scores = []
+    for _ in range(8):
+        y = np.random.randint(0, max(1, h // 3))
+        x = np.random.randint(0, max(1, w // 3))
+        crop = img[y:y + h // 3, x:x + w // 3]
+        if crop.size == 0:
+            continue
+        scores.append(float(np.var(crop)))
+    if not scores:
+        return 0.0
+    scores = np.array(scores, dtype=np.float32)
+    return float(1.0 - min(np.std(scores) / 100.0, 1.0))
+
+
+def grain_likelihood(img_np: np.ndarray) -> float:
+    """Photographic grain prior; higher → more real."""
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    hp = gray - cv2.GaussianBlur(gray, (0, 0), sigmaX=1.2)
+    mean_noise = np.mean(np.abs(hp))
+    return float(min(mean_noise / 3.0, 1.0))
+
+
+def _extract_prnu_std(img_gray: np.ndarray) -> float:
+    """
+    PRNU std-based real prior component.
+    Simple wavelet-like denoising residual; higher → more real.
+    """
+    denoised = cv2.fastNlMeansDenoising(img_gray, None, 10, 7, 21)
+    noise = img_gray.astype(np.float32) - denoised.astype(np.float32)
+    prnu_std = noise.std() / 255.0
+    prnu_std = np.clip(prnu_std * 4.0, 0.0, 1.0)
+    return float(prnu_std)
+
+
+def extract_prnu_std(img_gray: np.ndarray) -> float:
+    """
+    Public PRNU std helper matching real_image_prior_v3 signature.
+    """
+    return _extract_prnu_std(img_gray)
+
+
+def extract_cfa_strength(img_bgr: np.ndarray) -> float:
+    """
+    CFA periodicity strength in the green channel.
+    Higher = more camera-like CFA structure.
+    """
+    h, w, _ = img_bgr.shape
+    if h < 2 or w < 2:
+        return 0.0
+    g = img_bgr[:, :, 1].astype(np.float32)
+    diff = np.abs(g[:, 1:] - g[:, :-1])
+    avg = float(diff.mean()) if diff.size else 0.0
+    cfa_strength = 1.0 - np.clip(avg / 32.0, 0.0, 1.0)
+    return float(np.clip(cfa_strength, 0.0, 1.0))
+
+
+def jpeg_residual_dct(img_gray: np.ndarray) -> float:
+    """
+    JPEG residual magnitude from 8x8 DCT AC coefficients.
+    Higher values indicate stronger camera-like quantization structure.
+    """
+    h, w = img_gray.shape
+    blocks = []
+    for y in range(0, h - 7, 8):
+        for x in range(0, w - 7, 8):
+            block = img_gray[y:y+8, x:x+8].astype(np.float32) - 128.0
+            blocks.append(dct(dct(block.T, norm="ortho").T, norm="ortho"))
+    if not blocks:
+        return 0.0
+    blocks = np.stack(blocks, axis=0)
+    ac = np.abs(blocks[:, 1:, 1:])  # ignore DC
+    mean_ac = float(np.mean(ac))
+    res = np.clip(mean_ac / 40.0, 0.0, 1.0)
+    return float(res)
+
+
+def real_image_prior_v2(img_bgr: np.ndarray) -> float:
+    """
+    Alternative REAL-image prior v2 (PRNU + CFA + JPEG DCT).
+    Returns a score in [0,1]; tuned so real photos with retouching
+    tend to get boosted while heavily synthetic / CFA-broken images do not.
+    """
+    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # 1. PRNU std (real cameras have stable residual noise)
+    prnu_std = _extract_prnu_std(img_gray)
+
+    # 2. CFA inverse (AI / resynthesis tends to break CFA)
+    cfa_strength = extract_cfa_strength(img_bgr)
+    cfa_inverse = 1.0 - cfa_strength
+
+    # 3. JPEG residual (small real camera signature)
+    jpeg_res = jpeg_residual_dct(img_gray)
+
+    score = (
+        prnu_std * 0.40 +
+        cfa_inverse * 0.35 +
+        jpeg_res * 0.25
+    )
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def extract_prnu_acorr(img_gray: np.ndarray) -> float:
+    """
+    PRNU autocorrelation peak: higher when sensor pattern is self-consistent.
+    """
+    den = cv2.fastNlMeansDenoising(img_gray, None, 10, 7, 21)
+    noise = img_gray.astype(np.float32) - den.astype(np.float32)
+    try:
+        corr = cv2.matchTemplate(noise, noise, cv2.TM_CCORR_NORMED)
+        ac_peak = float(corr.mean())
+    except Exception:
+        return 0.0
+    return float(np.clip((ac_peak - 0.95) * 20.0, 0.0, 1.0))
+
+
+def extract_cfa_inverse(img_bgr: np.ndarray) -> float:
+    """
+    CFA inverse: higher when CFA structure is broken / AI-like.
+    """
+    strength = extract_cfa_strength(img_bgr)
+    return float(1.0 - strength)
+
+
+def extract_demosaic_error(img_bgr: np.ndarray) -> float:
+    """
+    Demosaic interpolation error (green channel); higher = less camera-like.
+    """
+    g = img_bgr[:, :, 1].astype(np.float32)
+    if g.size == 0:
+        return 0.0
+    kernel = np.array([[0.25, 0.5, 0.25]], dtype=np.float32)
+    recon = cv2.filter2D(g, -1, kernel)
+    err = float(np.abs(g - recon).mean())
+    score = np.clip(err / 20.0, 0.0, 1.0)
+    return float(score)
+
+
+def jpeg_residual(img_gray: np.ndarray) -> float:
+    """
+    JPEG residual (AC mean) on 8x8 blocks; higher = stronger JPEG structure.
+    """
+    h, w = img_gray.shape
+    vals = []
+    for y in range(0, h - 7, 8):
+        for x in range(0, w - 7, 8):
+            block = img_gray[y:y+8, x:x+8].astype(np.float32) - 128.0
+            d = dct(dct(block.T, norm="ortho").T, norm="ortho")
+            vals.append(float(np.mean(np.abs(d[1:, 1:]))))
+    if not vals:
+        return 0.0
+    mean_ac = float(np.mean(vals))
+    return float(np.clip(mean_ac / 40.0, 0.0, 1.0))
+
+
+def qtable_consistency(img_gray: np.ndarray) -> float:
+    """
+    JPEG Q-table consistency: higher = more consistent camera-like compression.
+    """
+    h, w = img_gray.shape
+    blocks = []
+    for y in range(0, h - 15, 16):
+        for x in range(0, w - 15, 16):
+            block = img_gray[y:y+16, x:x+16]
+            blocks.append(float(block.std()))
+    if not blocks:
+        return 0.0
+    blocks_arr = np.array(blocks, dtype=np.float32)
+    var = float(blocks_arr.std())
+    score = 1.0 - np.clip(var / 20.0, 0.0, 1.0)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def hf_glcm_contrast(img_gray: np.ndarray) -> float:
+    """
+    High-frequency GLCM contrast; higher = more real photographic structure.
+    Falls back to 0.0 if skimage is unavailable.
+    """
+    if greycomatrix is None or greycoprops is None:
+        return 0.0
+    try:
+        hf = cv2.Laplacian(img_gray, cv2.CV_32F)
+        hf = cv2.normalize(hf, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        gl = greycomatrix(hf, [1], [0], levels=256, symmetric=True, normed=True)
+        contrast = float(greycoprops(gl, "contrast")[0, 0])
+        score = np.clip(contrast / 2000.0, 0.0, 1.0)
+        return float(score)
+    except Exception:
+        return 0.0
+
+
+def real_image_prior_v3(img_bgr: np.ndarray) -> float:
+    """
+    REAL-image prior v3 (0=fake, 1=real) combining:
+      - PRNU std + autocorrelation
+      - CFA inverse (as real = 1-cfa_inv)
+      - demosaic error structure
+      - JPEG residual + Q-table consistency
+      - high-frequency GLCM contrast
+    """
+    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    prnu_std = extract_prnu_std(img_gray)
+    prnu_ac = extract_prnu_acorr(img_gray)
+    cfa_inv = extract_cfa_inverse(img_bgr)
+    dem_err = extract_demosaic_error(img_bgr)
+    jpeg_res = jpeg_residual(img_gray)
+    jpeg_q = qtable_consistency(img_gray)
+    glcm_hf = hf_glcm_contrast(img_gray)
+
+    score = (
+        prnu_std * 0.22 +
+        prnu_ac * 0.18 +
+        (1.0 - cfa_inv) * 0.12 +
+        (1.0 - dem_err) * 0.12 +
+        jpeg_res * 0.12 +
+        jpeg_q * 0.12 +
+        glcm_hf * 0.12
+    )
+
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def multiscale_fft_confidence(pil: Image.Image) -> bool:
+    """
+    Multi-scale FFT consistency: True → real, False → fake.
+    Checks stability of spectral energy across 256/128/64 crops.
+    """
+    sizes = [256, 128, 64]
+    scores = []
+    for sz in sizes:
+        arr = np.asarray(pil.resize((sz, sz)))
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            continue
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        F = np.fft.fft2(gray)
+        mag = np.abs(np.fft.fftshift(F))
+        scores.append(float(np.std(mag)))
+    if len(scores) < 2:
+        return False
+    scores_arr = np.array(scores, dtype=np.float32)
+    diff = float(scores_arr.max() - scores_arr.min())
+    mean = float(scores_arr.mean() + 1e-6)
+    return bool(diff < 0.15 * mean)
 
 
 def noiseprint_score(img_np: np.ndarray) -> float:
@@ -927,6 +1201,304 @@ def noiseprint_score(img_np: np.ndarray) -> float:
     consistency = 1.0 - min(std_v / mean_v, 1.0)
     fake_score = 1.0 - consistency  # higher = more inconsistent noise → more fake
     return float(np.clip(fake_score, 0.0, 1.0))
+
+
+# ============================================================
+#  FFT VISUALIZATION UTILITIES (ADVANCED PANEL)
+# ============================================================
+
+def fft_maps(img_gray: np.ndarray):
+    """
+    Return log-magnitude and phase FFT maps for a grayscale image.
+    """
+    f = np.fft.fft2(img_gray)
+    fshift = np.fft.fftshift(f)
+    magnitude = np.log1p(np.abs(fshift))
+    phase = np.angle(fshift)
+    return magnitude, phase
+
+
+# ============================================================
+#   FORENSIC MAP HELPERS (FFT / PRNU / CFA / JPEG / GRAIN)
+# ============================================================
+
+def fft_mag_phase(gray: np.ndarray):
+    """
+    FFT magnitude + phase using numpy. Returns (mag_log, phase).
+    """
+    F = np.fft.fft2(gray)
+    Fshift = np.fft.fftshift(F)
+    mag = np.log1p(np.abs(Fshift))
+    phase = np.angle(Fshift)
+    return mag, phase
+
+
+def prnu_autocorr(gray: np.ndarray):
+    """
+    PRNU autocorrelation (v4): returns (scalar_ac, prnu_map).
+    """
+    den = cv2.fastNlMeansDenoising(gray.astype(np.uint8), None, 10, 7, 21)
+    noise = gray.astype(np.float32) - den.astype(np.float32)
+    try:
+        corr = cv2.matchTemplate(noise, noise, cv2.TM_CCORR_NORMED)
+        ac = float(corr.mean())
+    except Exception:
+        ac = 0.0
+    ac = float(np.clip(ac, 0.0, 1.0))
+    return ac, noise
+
+
+def cfa_consistency(img_rgb: np.ndarray):
+    """
+    CFA periodicity consistency map on green channel.
+    """
+    g = img_rgb[:, :, 1].astype(np.float32)
+    diff = np.abs(g[:, 1:] - g[:, :-1])
+    cfa_map = gaussian_filter(diff, sigma=1.2)
+    cfa_map = (cfa_map - cfa_map.min()) / (cfa_map.max() - cfa_map.min() + 1e-6)
+    return cfa_map
+
+
+def jpeg_block_coherence(gray: np.ndarray):
+    """
+    JPEG 8x8 block coherence: scalar + visual grid map.
+    """
+    h, w = gray.shape
+    blocks = []
+    for y in range(0, h - 8, 8):
+        for x in range(0, w - 8, 8):
+            block = gray[y:y+8, x:x+8].astype(np.float32)
+            blocks.append(float(block.std()))
+    if not blocks:
+        coherence = 0.0
+    else:
+        blocks = np.array(blocks, dtype=np.float32)
+        std = float(blocks.std())
+        coherence = 1.0 - min(std / 30.0, 1.0)
+    vis = np.zeros_like(gray, dtype=np.float32)
+    vis[::8, :] = 1.0
+    vis[:, ::8] = 1.0
+    vis = gaussian_filter(vis, sigma=1.0)
+    return float(np.clip(coherence, 0.0, 1.0)), vis
+
+
+def hf_phase_randomness(gray: np.ndarray):
+    """
+    High-frequency phase randomness: real > random; AI tends to be structured.
+    Returns (score, phase_map).
+    """
+    F = np.fft.fft2(gray)
+    Fshift = np.fft.fftshift(F)
+    phase = np.angle(Fshift)
+    s = float(np.std(phase))
+    score = 1.0 - min(s / np.pi, 1.0)
+    return float(np.clip(score, 0.0, 1.0)), phase
+
+
+def hf_lf_fusion(gray: np.ndarray, cutoff: int = 20):
+    h, w = gray.shape
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+    crow, ccol = h // 2, w // 2
+    mask_low = np.zeros_like(fshift)
+    mask_low[crow-cutoff:crow+cutoff, ccol-cutoff:ccol+cutoff] = 1
+    mask_high = 1 - mask_low
+    low = np.log1p(np.abs(fshift * mask_low))
+    high = np.log1p(np.abs(fshift * mask_high))
+    return low, high
+
+
+def radial_profile(data: np.ndarray):
+    h, w = data.shape
+    y, x = np.indices((h, w))
+    cy, cx = h // 2, w // 2
+    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2).astype(np.int32)
+    tbin = np.bincount(r.ravel(), weights=data.ravel())
+    nr = np.bincount(r.ravel())
+    radial_mean = tbin / nr
+    return radial_mean[: min(h, w) // 2]
+
+
+def patch_fft_anomaly(gray: np.ndarray, patch: int = 32):
+    H, W = gray.shape
+    if H < patch or W < patch:
+        return np.zeros_like(gray, dtype=np.float32)
+    out = np.zeros((H // patch, W // patch), np.float32)
+    for i in range(0, H - patch, patch):
+        for j in range(0, W - patch, patch):
+            blk = gray[i:i+patch, j:j+patch]
+            F = np.fft.fft2(blk)
+            Fshift = np.fft.fftshift(F)
+            mag = np.log1p(np.abs(Fshift))
+            out[i // patch, j // patch] = float(mag.mean())
+    out = (out - out.min()) / (out.max() - out.min() + 1e-6)
+    out = cv2.resize(out, (W, H), interpolation=cv2.INTER_NEAREST)
+    return gaussian_filter(out, sigma=1.0)
+
+
+def srm_energy(gray: np.ndarray):
+    k = [
+        np.array([[0, 1, 0],[1, -4, 1],[0, 1, 0]], np.float32),
+        np.array([[-1, 2, -1],[2, -4, 2],[-1, 2, -1]], np.float32),
+        np.array([[1, -2, 1],[-2, 4, -2],[1, -2, 1]], np.float32),
+    ]
+    energies = []
+    maps = []
+    for f in k:
+        r = cv2.filter2D(gray, -1, f)
+        energies.append(float((r**2).mean()))
+        maps.append(r)
+    energy = float(np.clip(sum(energies)/len(energies)/2000.0, 0.0, 1.0))
+    return energy, maps
+
+
+def grain_likelihood_map(gray: np.ndarray):
+    hp = gray - cv2.GaussianBlur(gray, (0, 0), 1.2)
+    grain = np.abs(hp)
+    grain_norm = (grain - grain.min()) / (grain.max() - grain.min() + 1e-6)
+    score = float(min(grain_norm.mean() / 0.15, 1.0))
+    return score, grain_norm
+
+
+def prnu_fft_consistency(noise: np.ndarray) -> float:
+    """
+    PRNU FFT consistency: real sensors → structured radial patterns,
+    synthetic PRNU → more random. Higher diff = less consistent.
+    """
+    try:
+        fft = np.fft.fft2(noise)
+        mag = np.abs(fft)
+        radial = mag.mean(axis=0)
+        smooth = gaussian_filter(radial, 3.0)
+        diff = np.mean(np.abs(radial - smooth))
+        return float(diff)
+    except Exception:
+        return 0.0
+
+
+def forensic_panel(img_bgr: np.ndarray) -> Image.Image:
+    """
+    3x3 forensic diagnostics grid:
+      - FFT magnitude/phase
+      - PRNU map & autocorr
+      - CFA consistency
+      - JPEG block coherence
+      - HF phase randomness
+      - SRM residual energy
+      - Patch FFT anomaly
+      - Grain likelihood map
+    """
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    fft_mag, fft_phase = fft_mag_phase(gray)
+    prnu_ac, prnu_map_img = prnu_autocorr(gray)
+    cfa_img = cfa_consistency(img_rgb)
+    jpeg_coh, jpeg_map = jpeg_block_coherence(gray)
+    hf_rand, phase_map = hf_phase_randomness(gray)
+    srm_val, srm_maps = srm_energy(gray)
+    patch_fft = patch_fft_anomaly(gray)
+    grain_val, grain_map = grain_likelihood_map(gray)
+
+    fig, axs = plt.subplots(3, 3, figsize=(10, 10))
+
+    axs[0, 0].imshow(fft_mag, cmap="inferno"); axs[0, 0].set_title("FFT Magnitude"); axs[0, 0].axis("off")
+    axs[0, 1].imshow(fft_phase, cmap="twilight"); axs[0, 1].set_title("FFT Phase"); axs[0, 1].axis("off")
+    axs[0, 2].imshow(prnu_map_img, cmap="gray"); axs[0, 2].set_title(f"PRNU Autocorr {prnu_ac:.2f}"); axs[0, 2].axis("off")
+
+    axs[1, 0].imshow(cfa_img, cmap="plasma"); axs[1, 0].set_title("CFA Consistency"); axs[1, 0].axis("off")
+    axs[1, 1].imshow(jpeg_map, cmap="gray"); axs[1, 1].set_title(f"JPEG Block Coherence {jpeg_coh:.2f}"); axs[1, 1].axis("off")
+    axs[1, 2].imshow(phase_map, cmap="twilight"); axs[1, 2].set_title(f"HF Phase Random {hf_rand:.2f}"); axs[1, 2].axis("off")
+
+    axs[2, 0].imshow(sum(srm_maps)/len(srm_maps), cmap="gray"); axs[2, 0].set_title(f"SRM Residual {srm_val:.2f}"); axs[2, 0].axis("off")
+    axs[2, 1].imshow(patch_fft, cmap="viridis"); axs[2, 1].set_title("Patch FFT Anomaly"); axs[2, 1].axis("off")
+    axs[2, 2].imshow(grain_map, cmap="hot"); axs[2, 2].set_title(f"Grain Likelihood {grain_val:.2f}"); axs[2, 2].axis("off")
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf)
+
+
+# ============================================================
+#   IMPROVEMENT HELPERS (REAL OVERRIDES / UPSCALER / ETC.)
+# ============================================================
+
+def real_hard_override(cfa, grain, jpeg):
+    if (
+        cfa is not None and cfa < 0.18 and
+        grain is not None and grain > 0.80 and
+        jpeg is not None and jpeg < 0.002
+    ):
+        return True
+    return False
+
+
+def esrgan_grid_score(gray):
+    F = np.fft.fftshift(np.fft.fft2(gray))
+    mag = np.log1p(np.abs(F))
+    v = float(mag[:, ::8].mean())
+    h = float(mag[::8, :].mean())
+    return float(np.clip((v + h) / 50.0, 0.0, 1.0))
+
+
+def saturation_peak_score(img_np):
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    s = hsv[:, :, 1].astype(np.float32)
+    peak_ratio = float(np.mean(s > 200))
+    return float(min(peak_ratio / 0.05, 1.0))
+
+
+def jpeg_q_mismatch(gray):
+    blocks = []
+    for y in range(0, gray.shape[0] - 8, 8):
+        for x in range(0, gray.shape[1] - 8, 8):
+            blk = gray[y:y+8, x:x+8].astype("float32")
+            blocks.append(cv2.Laplacian(blk, cv2.CV_32F).var())
+    if not blocks:
+        return 0.0
+    blocks = np.array(blocks, dtype=np.float32)
+    return float(min(blocks.std() / 30.0, 1.0))
+
+
+def face_region_retouch_score(face_bgr):
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    perlin = perlin_diffusion_score_fixed(face_bgr)
+    HF = cv2.Laplacian(gray, cv2.CV_32F).var()
+    hf_flat = float(np.clip(1 - HF / 200.0, 0.0, 1.0))
+    return 0.5 * perlin + 0.5 * hf_flat
+
+
+def exposure_variation(gray):
+    hist = cv2.equalizeHist(gray)
+    return float(np.std(hist) / 60.0)
+
+
+def real_confidence_stabilizer(real_prior, forensic):
+    if real_prior is not None and real_prior > 0.55 and forensic < 0.60:
+        return True
+    return False
+
+
+def stable_patch_score(res):
+    return 0.5 * res.get("visual_prob", 0.5) + 0.5 * res.get("freq_prob", 0.5)
+
+
+def low_res_penalty(w, h):
+    if min(w, h) < 256:
+        return 0.9
+    return 1.0
+
+
+def confidence_text(cert):
+    if cert > 0.55:
+        return "Confidence: HIGH"
+    elif cert > 0.30:
+        return "Confidence: MEDIUM"
+    else:
+        return "Confidence: LOW – verify manually"
 
 def emd_mode_mixing_score(img_np: np.ndarray) -> float:
     try:
@@ -965,6 +1537,52 @@ def forensic_score(img_np: np.ndarray) -> float:
 # ============================================================
 #  FORENSIC V2: Classic + Diffusion Deepfake Predictors
 # ============================================================
+
+def perlin_diffusion_score_fixed(img_bgr: np.ndarray) -> float:
+    """
+    Fixed Perlin Diffusion Score:
+    - Much lower false positives on real photos
+    - Still very sensitive to diffusion-style smoothness
+    Expects BGR array in OpenCV format; returns [0,1] fake score.
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return 0.0
+
+    img = img_bgr.astype(np.float32)
+    if img.max() > 1.0:
+        img = img / 255.0
+
+    gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+    # 1. Gradient Smoothness Map (Perlin Core)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx * gx + gy * gy)
+    grad_norm = grad_mag / (grad_mag.mean() + 1e-6)
+    smoothness = float(np.exp(-np.std(grad_norm)))
+
+    # 2. High-Frequency Residual Energy (AI images have too little high-freq)
+    high_pass = gray - gaussian_filter(gray, sigma=1.2)
+    hf_std = float(high_pass.std())
+    hf_penalty = float(np.clip(1.0 - (hf_std / 0.03), 0.0, 1.0))
+
+    # 3. Local Entropy Check (Real images have more entropy)
+    entropy = cv2.Laplacian(gray, cv2.CV_32F)
+    entropy_score = float(np.exp(-np.std(entropy)))
+
+    # 4. PRNU-lite Camera Noise Check (Real sensors leave micro-noise)
+    prnu_map = gray - gaussian_filter(gray, sigma=2.5)
+    prnu_std = float(prnu_map.std())
+    prnu_penalty = float(np.clip(1.0 - (prnu_std / 0.01), 0.0, 1.0))
+
+    score = (
+        0.45 * smoothness +
+        0.25 * hf_penalty +
+        0.15 * entropy_score +
+        0.15 * prnu_penalty
+    )
+
+    return float(np.clip(score, 0.0, 1.0))
 
 def perlin_residual_score(img_np):
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
@@ -1124,7 +1742,8 @@ def forensic_v2(img_np):
     """Returns: forensic_score_v2 ∈ [0,1], diffusion_score ∈ [0,1]. Higher = fake."""
     forensic_classic = forensic_score(img_np)
     diff_score = diffusion_score(img_np)
-    perlin_score = diffusion_perlin_residual(img_np)
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    perlin_score = perlin_diffusion_score_fixed(img_bgr)
     texture_noise = texture_noise_score(img_np)
     noiseprint = noiseprint_score(img_np)
     # Prioritize Perlin, texture/noise, and noiseprint for diffusion-based fakes
@@ -1158,6 +1777,98 @@ def texture_noise_score(img_np):
     noise_score = min(hf_noise / 5.0, 1.0)  # High score for anomalous noise
     return float(np.clip(0.5 * texture_score + 0.5 * noise_score, 0, 1))
 
+
+def asymmetry_score(img_np: np.ndarray) -> float:
+    """
+    Local left-right asymmetry; higher → more fake.
+    Particularly sensitive to symmetric AI portraits / products.
+    """
+    h, w, _ = img_np.shape
+    if w < 4:
+        return 0.0
+    mid = w // 2
+    left = img_np[:, :mid]
+    right = img_np[:, mid:]
+    if right.shape[1] == 0:
+        return 0.0
+    right_flip = np.flip(right, axis=1)
+    min_w = min(left.shape[1], right_flip.shape[1])
+    left = left[:, :min_w].astype(np.float32)
+    right_flip = right_flip[:, :min_w].astype(np.float32)
+    diff = np.mean(np.abs(left - right_flip))
+    score = 1.0 - min(diff / 25.0, 1.0)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def color_harmony_score(img_np: np.ndarray) -> float:
+    """
+    Color harmony histogram dispersion; higher → more fake.
+    Captures unnatural hue clumping / plastic skin / synthetic skies.
+    """
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    h = hsv[..., 0].flatten()
+    hist, _ = np.histogram(h, bins=36, range=(0, 180))
+    return float(min(np.std(hist) / 200.0, 1.0))
+
+
+def histogram_consistency(img_bgr: np.ndarray, block: int = 64, bins: int = 32) -> float:
+    """
+    Histogram Consistency (HC)
+    - Measures color histogram similarity across blocks.
+    - Low HC = consistent (real)
+    - High HC = inconsistent (tampering/splicing/local editing)
+    """
+    h, w, _ = img_bgr.shape
+    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    H, W = h // block, w // block
+    if H <= 0 or W <= 0:
+        return 0.0
+
+    histograms = []
+    for i in range(H):
+        for j in range(W):
+            tile = img_hsv[i * block : (i + 1) * block, j * block : (j + 1) * block]
+            hist = cv2.calcHist(
+                [tile],
+                [0, 1, 2],
+                None,
+                [bins, bins, bins],
+                [0, 180, 0, 256, 0, 256],
+            )
+            hist = cv2.normalize(hist, hist).flatten()
+            histograms.append(hist)
+
+    histograms = np.array(histograms, dtype=np.float32)
+    if histograms.shape[0] < 2:
+        return 0.0
+
+    norms = np.linalg.norm(histograms, axis=1, keepdims=True) + 1e-8
+    norm_hist = histograms / norms
+    sim = np.dot(norm_hist, norm_hist.T)
+
+    inconsistency = 1.0 - float(np.mean(sim))
+    return float(np.clip(inconsistency, 0.0, 1.0))
+
+
+def real_prior_v2(pil: Image.Image) -> float:
+    """
+    Aggregated REAL-image prior ∈ [0,1].
+    Higher → stronger evidence of a real camera pipeline.
+    Uses JPEG block patterns, highlight clipping, crop consistency,
+    CFA Bayer pattern, PRNU variance, grain, and multiscale FFT stability.
+    """
+    img_np = np.asarray(pil.convert("RGB"))
+    r1 = jpeg_block_consistency(img_np)
+    r2 = highlight_clipping_realness(img_np)
+    r3 = crop_consistency_score(pil)
+    r4 = 1.0 - cfa_bayer_score(img_np)
+    r5 = prnu_consistency_score(img_np)
+    r6 = grain_likelihood(img_np)
+    r7 = float(multiscale_fft_confidence(pil))
+    prior = (r1 + r2 + r3 + r4 + r5 + r6 + r7) / 7.0
+    return float(np.clip(prior, 0.0, 1.0))
+
 # ============================================================
 # CLUE 1: Spectral Flatness (Diffusion "Flat Spectrum" Signature)
 # ============================================================
@@ -1190,26 +1901,7 @@ def spectral_flatness_score(img_np):
     return score
 
 # ============================================================
-# CLUE 2: Edge Continuity Anomaly (AI edges are too clean)
-# ============================================================
-def edge_continuity_score(img_np):
-    """AI edges are unnaturally smooth; real photos have micro-breaks."""
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY).astype(np.uint8)
-    edges = cv2.Canny(gray, 50, 150)
-    if edges.sum() == 0:
-        return 0.0
-
-    # Dilate to connect nearby edge pixels
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    dilated = cv2.dilate(edges, kernel, iterations=1)
-    connected = dilated - edges  # newly connected gaps
-
-    gap_ratio = float(connected.sum()) / (float(edges.sum()) + 1e-8)
-    score = float(np.clip(gap_ratio * 3.0, 0.0, 1.0))  # AI tends to fill more gaps
-    return score
-
-# ============================================================
-# CLUE 3: Color Correlation Drift (AI colors decorrelated)
+# CLUE 2: Color Correlation Drift (AI colors decorrelated)
 # ============================================================
 def color_correlation_score(img_np):
     """AI often breaks natural RGB channel correlations."""
@@ -1351,8 +2043,20 @@ def detect_core(pil, siglip, freq_mlp, multicrop=True):
         fvec = extract_freq_vector(pil).unsqueeze(0).to(FREQ_DEVICE)
         z_freq = float(freq_mlp(fvec).item())
 
+    # Second SigLIP head: 90° rotated view (dual-view stabilizer)
+    try:
+        pil_rot = pil.rotate(90, expand=False)
+        x_rot = preprocess(pil_rot).unsqueeze(0).to(DEVICE)
+        z_rot = float(siglip(x_rot).item())
+        base_prob = float(torch.sigmoid(torch.tensor(z_sig)).item())
+        rot_prob = float(torch.sigmoid(torch.tensor(z_rot)).item())
+        visual_prob = 0.6 * base_prob + 0.4 * rot_prob
+        z_sig = float(_logit(visual_prob))
+    except Exception:
+        visual_prob = float(torch.sigmoid(torch.tensor(z_sig)).item())
+
     # Head-wise probabilities for diagnostics
-    p_sig = float(torch.sigmoid(torch.tensor(z_sig)).item())
+    p_sig = visual_prob
     p_freq = float(torch.sigmoid(torch.tensor(z_freq / FREQ_TEMP)).item())
 
     # ---------- Fusion: required simple 2->1 head on probabilities ----------
@@ -1402,8 +2106,8 @@ def detect_core(pil, siglip, freq_mlp, multicrop=True):
         "p_fake_raw": p_fake_raw,
         "p_fake_coral": p_coral_gauss,
         "p_blend": p_blend,           # main base probability
-        "visual_prob": float(torch.sigmoid(torch.tensor(z_sig)).item()),
-        "freq_prob": float(torch.sigmoid(torch.tensor(z_freq / FREQ_TEMP)).item()),
+        "visual_prob": float(p_sig),
+        "freq_prob": float(p_freq),
         "p_or": None,
         "p_moe": None,
         "risk_idx": risk_idx,
@@ -1416,17 +2120,40 @@ def detect_core(pil, siglip, freq_mlp, multicrop=True):
 # ============================================================
 
 def make_multicrops(pil):
-    w,h = pil.size
-    w2,h2 = max(1,w//2), max(1,h//2)
-    crops = [
-        pil,
-        pil.resize((IMG_SIZE,IMG_SIZE), Image.BICUBIC),
-        pil.crop((0,0,w2,h2)),
-        pil.crop((w2,0,w,h2)),
-        pil.crop((0,h2,w2,h)),
-        pil.crop((w2,h2,w,h)),
-    ]
-    weights = torch.tensor([0.4,0.4,0.05,0.05,0.05,0.05])
+    """
+    9-crop ensemble:
+      - center
+      - left / right
+      - top / bottom
+      - 4 quadrants
+    """
+    w, h = pil.size
+    if w < 4 or h < 4:
+        return [pil.resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC)], torch.tensor([1.0])
+
+    mid_w, mid_h = w // 2, h // 2
+
+    # Center crop (50% size)
+    cw, ch = max(1, w // 2), max(1, h // 2)
+    cx0 = max(0, (w - cw) // 2)
+    cy0 = max(0, (h - ch) // 2)
+    center = pil.crop((cx0, cy0, cx0 + cw, cy0 + ch))
+
+    left = pil.crop((0, 0, mid_w, h))
+    right = pil.crop((w - mid_w, 0, w, h))
+    top = pil.crop((0, 0, w, mid_h))
+    bottom = pil.crop((0, h - mid_h, w, h))
+
+    tl = pil.crop((0, 0, mid_w, mid_h))
+    tr = pil.crop((w - mid_w, 0, w, mid_h))
+    bl = pil.crop((0, h - mid_h, mid_w, h))
+    br = pil.crop((w - mid_w, h - mid_h, w, h))
+
+    crops = [center, left, right, top, bottom, tl, tr, bl, br]
+    weights = torch.tensor(
+        [0.20, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10],
+        dtype=torch.float32,
+    )
     return crops, weights
 
 
@@ -1514,11 +2241,24 @@ def make_heatmap_overlay(pil, grid):
     else:
         patches_norm = normalize_for_heatmap(arr)
 
+    # Build a matplotlib figure with a colorbar key for the heatmap
     cmap = plt.get_cmap("jet")
-    colored = cmap(patches_norm)[...,:3]
-    img = (colored*255).astype(np.uint8)
-    heat = Image.fromarray(img).resize((w,h), Image.BILINEAR)
-    return Image.blend(pil.convert("RGBA"), heat.convert("RGBA"), alpha=0.45)
+    fig, ax = plt.subplots(figsize=(3, 3))
+    im = ax.imshow(patches_norm, cmap=cmap, vmin=0.0, vmax=1.0)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Local fake score", fontsize=8)
+    plt.tight_layout(pad=0.2)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    heat_raw = Image.open(buf).convert("RGBA").resize((w, h), Image.BILINEAR)
+
+    # Blend original image with the colored heatmap
+    base = pil.convert("RGBA")
+    return Image.blend(base, heat_raw, alpha=0.45)
 
 
 def region_name(r,c,rows,cols):
@@ -1635,6 +2375,170 @@ def is_inconclusive(p, pg, pp, risk, entropy, head_delta):
         head_delta >= 0.15
     )
 
+
+# ============================================================
+#     RETOUCHED-BUT-REAL CLASSIFIER (RBR, 3rd CLASS)
+# ============================================================
+
+def classify_rbr(
+    fake_score,
+    real_prior,
+    forensic,
+    cfa_fake,
+    perlin,
+    grain,
+    fft_conf,
+    patch_mean,
+    patch_spread,
+):
+    """
+    Returns: ("REAL" | "RBR" | "FAKE", numeric_code: 0.0 | 0.5 | 1.0)
+    REAL  = camera-native real
+    RBR   = real base photo but cosmetically retouched / AI-polished
+    FAKE  = fully synthetic / deepfake-like
+    """
+    fake_score = float(np.clip(fake_score, 0.0, 1.0))
+    real_prior = float(np.clip(real_prior, 0.0, 1.0))
+    forensic = float(np.clip(forensic, 0.0, 1.0))
+    cfa_fake = float(np.clip(cfa_fake, 0.0, 1.0))
+    perlin = float(np.clip(perlin, 0.0, 1.0))
+    grain = float(np.clip(grain, 0.0, 1.0))
+    fft_conf = float(np.clip(fft_conf, 0.0, 1.0))
+    patch_mean = float(np.clip(patch_mean, 0.0, 1.0))
+    patch_spread = float(np.clip(patch_spread, 0.0, 1.0))
+
+    # Strong REAL conditions
+    if real_prior > 0.75 and fake_score < 0.35:
+        return "REAL", 0.0
+
+    # Strong FAKE conditions
+    if fake_score > 0.75 and real_prior < 0.30:
+        return "FAKE", 1.0
+
+    # --- RBR core logic ---
+    rbr_conditions = 0
+
+    # Real-prior moderate
+    if 0.35 <= real_prior <= 0.75:
+        rbr_conditions += 1
+
+    # Fake-score moderate
+    if 0.30 <= fake_score <= 0.70:
+        rbr_conditions += 1
+
+    # Forensic mid-level anomalies
+    if 0.40 <= forensic <= 0.75:
+        rbr_conditions += 1
+
+    # CFA partially broken (usually retouching)
+    if 0.35 <= cfa_fake <= 0.70:
+        rbr_conditions += 1
+
+    # Perlin low (not fully AI)
+    if perlin < 0.40:
+        rbr_conditions += 1
+
+    # Natural grain present
+    if grain > 0.80:
+        rbr_conditions += 1
+
+    # FFT "flatness" too low → retouched (low confidence in multiscale FFT)
+    if fft_conf < 0.25:
+        rbr_conditions += 1
+
+    # Very smooth patch grid → denoised/enhanced
+    if patch_mean < 0.60 and patch_spread < 0.05:
+        rbr_conditions += 1
+
+    # Threshold: 4 signals is enough to mark RBR
+    if rbr_conditions >= 4:
+        return "RBR", 0.5
+
+    # If unsure fallback to FAKE/REAL
+    if fake_score >= 0.60:
+        return "FAKE", 1.0
+    else:
+        return "REAL", 0.0
+
+
+def classify_three_way(
+    fake_score,
+    real_prior_v3,
+    forensic_score,
+    cfa_fake,
+    perlin,
+    grain,
+    fft_conf,
+    patch_mean,
+    patch_spread,
+    jpeg_resid,
+    hist_consistency,
+    texture_noise,
+):
+    """
+    Simplified 3-way classifier:
+      REAL / TAMPERED / FAKE
+    """
+    # Normalize / default
+    S = float(np.clip(fake_score, 0.0, 1.0))
+    R = float(np.clip(real_prior_v3 if real_prior_v3 is not None else 0.0, 0.0, 1.0))
+    F = float(np.clip(forensic_score if forensic_score is not None else 0.0, 0.0, 1.0))
+    C = float(np.clip(cfa_fake if cfa_fake is not None else 0.0, 0.0, 1.0))
+    P = float(np.clip(perlin if perlin is not None else 0.0, 0.0, 1.0))
+    G = float(np.clip(grain if grain is not None else 0.0, 0.0, 1.0))
+    FFT = bool(fft_conf)
+    M = float(np.clip(patch_mean if patch_mean is not None else 0.0, 0.0, 1.0))
+    PS = float(np.clip(patch_spread if patch_spread is not None else 0.0, 0.0, 1.0))
+    J = float(np.clip(jpeg_resid if jpeg_resid is not None else 0.0, 0.0, 1.0))
+    HC = float(np.clip(hist_consistency if hist_consistency is not None else 0.0, 0.0, 1.0))
+    T = float(np.clip(texture_noise if texture_noise is not None else 0.0, 0.0, 1.0))
+
+    # --------------------------
+    # 1 — DEFINITE FAKE
+    # --------------------------
+    if S > 0.75 and R < 0.30:
+        return "FAKE"
+    if P > 0.80 and F > 0.60:
+        return "FAKE"
+    if C > 0.85:
+        return "FAKE"
+
+    # --------------------------
+    # 2 — DEFINITE REAL
+    # --------------------------
+    if R > 0.70 and C < 0.25 and P < 0.40:
+        return "REAL"
+    if G > 0.80 and C < 0.20:
+        return "REAL"
+    if FFT and F < 0.50:
+        return "REAL"
+
+    # --------------------------
+    # 3 — TAMPERED (simplified)
+    # Must have:
+    #   - moderately broken CFA
+    #   - at least one other anomaly
+    # --------------------------
+    tamper_flag = (
+        (0.35 < C < 0.80)
+        and (
+            F > 0.60
+            or P > 0.55
+            or HC > 0.75
+            or J > 0.80
+            or PS < 0.04
+            or T > 0.65
+        )
+    )
+
+    if tamper_flag:
+        return "TAMPERED"
+
+    # --------------------------
+    # Default REAL
+    # --------------------------
+    return "REAL"
+
 # ============================================================
 #            BAYESIAN HELPERS (LIKELIHOOD-BASED FUSION)
 # ============================================================
@@ -1686,9 +2590,10 @@ def final_decision(
     patch_mean,
     head_delta,
     spectral_score=0.0,
-    edge_score=0.0,
     color_score=0.0,
     face_boost=0.0,
+    cfa_fake_score=None,
+    real_prior=None,
 ):
     """
     Fully Bayesian hierarchical model:
@@ -1711,11 +2616,16 @@ def final_decision(
     p_forensic = _clamp01(forensic_score)
     p_diff_raw = _clamp01(diff_score)
     p_spec     = _clamp01(spectral_score)
-    p_edge     = _clamp01(edge_score)
     p_color    = _clamp01(color_score)
 
     p_patch_mean = _clamp01(patch_mean if patch_mean is not None else 0.5)
     p_patch_max  = _clamp01(max_patch   if max_patch   is not None else 0.5)
+
+    # REAL prior → fake probability (1 - prior)
+    p_real_prior = None
+    if real_prior is not None:
+        rp = _clamp01(real_prior)
+        p_real_prior = _clamp01(1.0 - rp)
 
     # ---------------------------
     # Level 1: Core fake signal
@@ -1738,8 +2648,8 @@ def final_decision(
     prior_diff = 0.30
 
     p_gen_diff = bayes_combine(
-        probs   = [p_diff_raw, p_spec, p_edge, p_color],
-        weights = [1.30, 0.80, 0.80, 0.80],
+        probs   = [p_diff_raw, p_spec, p_color],
+        weights = [1.30, 0.80, 0.80],
         prior   = prior_diff,
     )
 
@@ -1755,8 +2665,8 @@ def final_decision(
     prior_cam_fake = 0.20
 
     p_fake_cam = bayes_combine(
-        probs   = [p_core_fake, p_forensic, p_patch_mean],
-        weights = [1.00, 0.70, 0.50],
+        probs   = [p_core_fake, p_forensic, p_patch_mean, p_real_prior],
+        weights = [1.00, 0.40, 0.25, 0.60],
         prior   = prior_cam_fake,
     )
 
@@ -1769,8 +2679,8 @@ def final_decision(
     prior_diff_fake = 0.60
 
     p_fake_diff = bayes_combine(
-        probs   = [p_core_fake, p_diff_raw, p_spec, p_edge, p_color, p_patch_max],
-        weights = [1.00, 1.00, 0.70, 0.70, 0.70, 0.60],
+        probs   = [p_core_fake, p_diff_raw, p_spec, p_color, p_patch_max],
+        weights = [1.00, 0.70, 0.55, 0.55, 0.50],
         prior   = prior_diff_fake,
     )
 
@@ -1778,6 +2688,12 @@ def final_decision(
     # Level 4: Mixture over generator type
     # ---------------------------
     p_final = p_gen_diff * p_fake_diff + (1.0 - p_gen_diff) * p_fake_cam
+
+    # CFA-based REAL tilt for moderate fake scores
+    if cfa_fake_score is not None and cfa_fake_score < 0.45:
+        odds = _odds(p_final)
+        odds *= 0.65   # 35% tilt toward real
+        p_final = _from_odds(odds)
 
     # ---------------------------
     # Bayesian face-specific tweak
@@ -1983,27 +2899,120 @@ def predict(image):
         spectral_score = 0.0
         edge_score = 0.0
         color_score = 0.0
+        asym_score = None
+        color_harmony = None
+        real_prior = None             # combined real prior
+        real_prior_alt = None         # v2 PRNU/CFA/JPEG prior
+        real_prior_v3_val = None      # v3 PRNU/CFA/DCT/GLCM prior
+        real_prior_v4 = None          # v4 PRNU-strength/CFA/JPEG/patch prior
+        grain_real = None
+        fft_conf_real = None
+        jpeg_is_real = None
+        jpeg_resid_v3 = None
+        esrgan_score = None
+        sat_peak = None
+        jpeg_q_score = None
+        exposure_score = None
+        face_retouch = None
+        prnu_noise = None
+        prnu_val_raw = 0.0
+        prnu_scaled = 0.0
+        prnu_fft_cons = 0.0
+        hc_score = None
         if DETECT_USE_FORENSICS:
             try:
                 img_np = np.asarray(pil.convert("RGB"))
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+                # PRNU v4: strength + FFT consistency
+                try:
+                    prnu_noise = extract_prnu(img_np)
+                    prnu_val_raw = prnu_strength(prnu_noise)
+                    prnu_scaled = float(np.clip(prnu_val_raw * 12.0, 0.0, 1.0))
+                    prnu_fft_cons = prnu_fft_consistency(prnu_noise)
+                except Exception as _e:
+                    print(f"[prnu_v4] error: {_e}")
+                    prnu_noise = None
+                    prnu_val_raw = 0.0
+                    prnu_scaled = 0.0
+                    prnu_fft_cons = 0.0
                 forensic_v2_score, diff_score = forensic_v2(img_np)
-                perlin_score = diffusion_perlin_residual(img_np)
+                perlin_score = perlin_diffusion_score_fixed(img_bgr)
                 cfa_fake_score = cfa_bayer_score(img_np)
                 texture_noise = texture_noise_score(img_np)
+                # Legacy real prior (FFT / CFA / PRNU / grain / crops)
+                real_prior_legacy = real_prior_v2(pil)
+                # New real priors based on PRNU/CFA/JPEG/GLCM in BGR pipeline
+                real_prior_alt = real_image_prior_v2(img_bgr)
+                real_prior_v3_val = real_image_prior_v3(img_bgr)
 
-                # New spectral / edge / color clues
+                # Real prior v4: PRNU-strength + CFA-real + JPEG-real + patch consistency
+                try:
+                    cfa_real = 1.0 - float(np.clip(cfa_fake_score, 0.0, 1.0)) if cfa_fake_score is not None else 0.5
+                    jpeg_real = 1.0 - float(np.clip(jpeg_q_score, 0.0, 1.0)) if jpeg_q_score is not None else 0.5
+                    patch_consistency = 1.0 - float(np.clip(p_patch_spread, 0.0, 1.0))
+                    real_prior_v4 = float(np.clip(
+                        0.35 * prnu_scaled +
+                        0.25 * cfa_real +
+                        0.20 * jpeg_real +
+                        0.20 * patch_consistency,
+                        0.0,
+                        1.0,
+                    ))
+                except Exception as _e:
+                    print(f"[real_prior_v4] error: {_e}")
+                    real_prior_v4 = None
+
+                priors = [
+                    p for p in (real_prior_legacy, real_prior_alt, real_prior_v3_val, real_prior_v4)
+                    if p is not None
+                ]
+                if priors:
+                    real_prior = float(np.clip(float(sum(priors)) / len(priors), 0.0, 1.0))
+                grain_real = grain_likelihood(img_np)
+                fft_conf_real = float(multiscale_fft_confidence(pil))
+                # Improvement 2: Upscaler fingerprints
+                esrgan_score = esrgan_grid_score(gray_full)
+                # Improvement 3: Beautification
+                sat_peak = saturation_peak_score(img_np)
+                # Improvement 4: JPEG Q mismatch
+                jpeg_q_score = jpeg_q_mismatch(gray_full)
+                # Improvement 6: Exposure consistency
+                exposure_score = exposure_variation(gray_full)
+
+                # Histogram Consistency (HC) – block-wise color histogram similarity
+                try:
+                    hc_score = histogram_consistency(img_bgr)
+                except Exception as _e:
+                    print(f"[hc] histogram_consistency error: {_e}")
+                    hc_score = None
+                # JPEG camera-likeness from v3 components
+                try:
+                    img_gray_prior = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                    jpeg_res_v3 = jpeg_residual(img_gray_prior)
+                    jpeg_q_val = qtable_consistency(img_gray_prior)
+                    jpeg_is_real = bool(jpeg_q_val >= 0.5)
+                    jpeg_resid_v3 = float(jpeg_res_v3)
+                except Exception:
+                    jpeg_is_real = None
+                    jpeg_resid_v3 = None
+
+                # New spectral / color clues (edge continuity and harmony disabled)
                 try:
                     spectral_score = spectral_flatness_score(img_np)
-                    edge_score = edge_continuity_score(img_np)
+                    edge_score = 0.0
                     color_score = color_correlation_score(img_np)
+                    asym_score = asymmetry_score(img_np)
+                    color_harmony = None  # disabled
                 except Exception as e:
                     print(f"[clues] error: {e}")
-                    spectral_score = edge_score = color_score = 0.0
+                    spectral_score = color_score = 0.0
+                    asym_score = color_harmony = None
 
                 # Optional face-specific boost for strong diffusion evidence on faces
                 if HAS_FACE:
                     try:
-                        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
                         faces = FACE_MODEL.get(img_bgr)
                         if len(faces) >= 1:
                             face = max(faces, key=lambda x: x.bbox[2] - x.bbox[0])
@@ -2012,7 +3021,8 @@ def predict(image):
                             x1 = min(img_np.shape[1], x1); y1 = min(img_np.shape[0], y1)
                             if x1 > x0 and y1 > y0:
                                 face_crop = img_np[y0:y1, x0:x1]
-                                perlin_face = diffusion_perlin_residual(face_crop)
+                                face_bgr = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
+                                perlin_face = perlin_diffusion_score_fixed(face_bgr)
                                 if perlin_face > 0.85:
                                     face_boost = 0.12
                                 elif perlin_face > 0.70:
@@ -2042,9 +3052,24 @@ def predict(image):
                 spectral_score = 0.0
                 edge_score = 0.0
                 color_score = 0.0
+                asym_score = None
+                color_harmony = None
+                real_prior = None
+                real_prior_alt = None
+                real_prior_v3_val = None
+                grain_real = None
+                fft_conf_real = None
+                jpeg_is_real = None
+                jpeg_resid_v3 = None
 
         # Fuse new clues into forensic_val as an additional soft boost
-        extra_clues = 0.33 * spectral_score + 0.33 * edge_score + 0.34 * color_score
+        extra_clues = 0.0
+        if spectral_score is not None:
+            extra_clues += 0.10 * spectral_score
+        if color_score is not None:
+            extra_clues += 0.10 * color_score
+        if asym_score is not None:
+            extra_clues += 0.05 * asym_score
         forensic_val = float(np.clip(forensic_val + 0.3 * extra_clues, 0.0, 1.0))
 
         # --------------------------------------------------------
@@ -2094,7 +3119,7 @@ def predict(image):
                         forensic_train,      # 6
                         float(diff_score),   # 7
                         float(spectral_score),  # 8
-                        float(edge_score),      # 9
+                        0.0,                    # 9 (edge continuity disabled)
                         float(color_score),     # 10
                         jpeg_resid,          # 11
                         embed_anom,          # 12
@@ -2137,12 +3162,54 @@ def predict(image):
             patch_mean=p_patch_mean,
             head_delta=head_delta,
             spectral_score=spectral_score,
-            edge_score=edge_score,
             color_score=color_score,
             face_boost=face_boost,
+            cfa_fake_score=cfa_fake_score,
+            real_prior=None,
         )
 
         p_moe = base["p_moe"] if base["p_moe"] is not None else None
+
+        # --------------------------------------------------------
+        #   Corrected Blending v4 (False-positive resistant)
+        # --------------------------------------------------------
+        # Step 0: base visual + freq heads
+        z_visual = float(visual_prob)
+        z_freq = float(freq_prob)
+        z_fused = 0.5 * z_visual + 0.5 * z_freq
+
+        # Step 1 — forensic moderation
+        if forensic_val is not None:
+            z_forensic = float(np.clip(forensic_val, 0.0, 1.0))
+            z_fused = 0.85 * z_fused + 0.15 * z_forensic
+
+        # Step 2 — REAL prior v3 override (0=fake,1=real)
+        if real_prior_v3_val is not None:
+            real_strength = float(np.clip(real_prior_v3_val, 0.0, 1.0))
+            z_fused = z_fused * (1.0 - real_strength * 0.45)
+
+        # Step 3 — Grain + JPEG rescue
+        if (
+            grain_real is not None
+            and grain_real > 0.90
+            and jpeg_resid_v3 is not None
+            and jpeg_resid_v3 < 0.002
+        ):
+            z_fused = min(z_fused, 0.65)
+
+        # Step 4 — CFA sanity correction
+        if cfa_fake_score is not None and cfa_fake_score < 0.35:
+            z_fused = z_fused * 0.90
+
+        # Use corrected blend as an upper bound on final fake probability
+        z_fused = float(np.clip(z_fused, 0.0, 1.0))
+        p_enhanced = float(min(p_enhanced, z_fused))
+
+        # Highlight clipping REAL bias
+        gray = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2GRAY)
+        clip_ratio = np.mean(gray > 245)
+        if clip_ratio > 0.01:
+            p_enhanced *= 0.85
 
         # --------------------------------------------------------
         #                Uncertain / Inconclusive
@@ -2172,6 +3239,50 @@ def predict(image):
             band_text = "UNCERTAIN - low confidence"
             band_color = "#cccccc"
 
+        # --------------------------------------------------------
+        #         RBR (Retouched-but-Real) 3rd-class label
+        # --------------------------------------------------------
+        rbr_label = None
+        rbr_code = None
+        try:
+            # fft_conf: True→1.0, False→0.0, None→0.5
+            if fft_conf_real is True:
+                fft_conf_val = 1.0
+            elif fft_conf_real is False:
+                fft_conf_val = 0.0
+            else:
+                fft_conf_val = 0.5
+
+            real_prior_v3_safe = real_prior_v3_val if real_prior_v3_val is not None else 0.0
+            forensic_safe = forensic_val if forensic_val is not None else 0.5
+            cfa_safe = cfa_fake_score if cfa_fake_score is not None else 0.5
+            perlin_safe = perlin_score if perlin_score is not None else 0.0
+            grain_safe = grain_real if grain_real is not None else 0.0
+
+            rbr_label, rbr_code = classify_rbr(
+                fake_score=float(np.clip(p_enhanced, 0.0, 1.0)),
+                real_prior=float(real_prior_v3_safe),
+                forensic=float(forensic_safe),
+                cfa_fake=float(cfa_safe),
+                perlin=float(perlin_safe),
+                grain=float(grain_safe),
+                fft_conf=float(fft_conf_val),
+                patch_mean=float(np.clip(p_patch_mean, 0.0, 1.0)),
+                patch_spread=float(np.clip(p_patch_spread, 0.0, 1.0)),
+            )
+        except Exception as _e:
+            print(f"[rbr] classify_rbr error: {_e}")
+            rbr_label, rbr_code = None, None
+
+        # Apply RBR only when not INCONCLUSIVE and base label is REAL-ish.
+        # Normalize all RBR outputs to the canonical label: TAMPERED.
+        if rbr_label == "RBR" and label not in ("INCONCLUSIVE", "FAKE"):
+            label = "TAMPERED"
+            risk_level = "TAMPERED"
+            band = "YELLOW"
+            band_color = BAND_COLORS[band]
+            band_text = "TAMPERED"
+
         # CFA-driven REAL override: strong Bayer pattern → trust camera
         if cfa_fake_score is not None and cfa_fake_score < 0.15:
             label = "REAL"
@@ -2193,28 +3304,117 @@ def predict(image):
                 label, p_enhanced, forensic_val
             )
 
+        # ============================================================
+        #   APPLY IMPROVEMENTS TO FINAL REAL / TAMPERED / FAKE DECISION
+        # ============================================================
+
+        # 1. REAL HARD OVERRIDE (cannot be fake)
+        if real_hard_override(cfa_fake_score, grain_real, jpeg_resid_v3):
+            label = "REAL"
+            p_enhanced = min(p_enhanced, 0.35)
+
+        # 2. Upscaler fingerprints → TAMPERED
+        if esrgan_score is not None and esrgan_score > 0.45 and label != "FAKE":
+            label = "TAMPERED"
+
+        # 3. Beautification detector → TAMPERED
+        if sat_peak is not None and sat_peak > 0.50 and label == "REAL":
+            label = "TAMPERED"
+
+        # 4. JPEG Q mismatch → TAMPERED
+        if jpeg_q_score is not None and jpeg_q_score > 0.60 and label != "FAKE":
+            label = "TAMPERED"
+
+        # 5. Face retouch evidence → TAMPERED
+        if face_retouch is not None and face_retouch > 0.55 and label == "REAL":
+            label = "TAMPERED"
+
+        # 6. Exposure uniformity → TAMPERED
+        if (
+            exposure_score is not None
+            and exposure_score < 0.30
+            and real_prior_v3_val is not None
+            and real_prior_v3_val > 0.30
+            and label != "FAKE"
+        ):
+            label = "TAMPERED"
+
+        # 7. REAL Confidence Stabilizer
+        if real_confidence_stabilizer(real_prior_v3_val, forensic_val):
+            p_enhanced *= 0.7
+
+        # 8. Low-res penalty
+        p_enhanced *= low_res_penalty(w, h)
+
+        # --------------------------------------------------------
+        #          Final 3-way classifier (REAL/TAMPERED/FAKE)
+        # --------------------------------------------------------
+        try:
+            three_way_label = classify_three_way(
+                fake_score=p_enhanced,
+                real_prior_v3=real_prior_v3_val,
+                forensic_score=forensic_val,
+                cfa_fake=cfa_fake_score,
+                perlin=perlin_score,
+                grain=grain_real,
+                fft_conf=fft_conf_real,
+                patch_mean=p_patch_mean,
+                patch_spread=p_patch_spread,
+                jpeg_resid=jpeg_q_score,
+                hist_consistency=hc_score,
+                texture_noise=texture_noise,
+            )
+            label = three_way_label
+        except Exception as _e:
+            print(f"[three_way] classify_three_way error: {_e}")
+
+        # --------------------------------------------------------
+        #          Simplified band text (3-way classes)
+        # --------------------------------------------------------
+        # For the main display, we expose only:
+        #   REAL, TAMPERED (RBR), or FAKE.
+        if label not in ("INCONCLUSIVE", "UNCERTAIN"):
+            if label == "REAL":
+                band_text = "REAL"
+            elif label in ("RBR", "RETOUCHED_REAL", "TAMPERED"):
+                band_text = "TAMPERED"
+            elif label == "FAKE":
+                band_text = "FAKE"
+
         certainty = abs(p_enhanced - 0.5) * 2.0
 
         # --------------------------------------------------------
-        #              Frequency-spectrum preview
+        #          Frequency-spectrum forensic panel (FFT)
         # --------------------------------------------------------
-        _, F = fft_features(pil)
-        fig, ax = plt.subplots(figsize=(3,3))
-        ax.imshow(np.log(F + 1e-3), cmap="inferno")
-        ax.axis("off")
-        sbuf = io.BytesIO()
-        plt.tight_layout(pad=0)
-        plt.savefig(sbuf, format="png")
-        plt.close(fig)
-        sbuf.seek(0)
-        spectrum_img = Image.open(sbuf)
+        fft_panel_img = None
+        if "img_bgr" in locals() and img_bgr is not None:
+            try:
+                fft_panel_img = forensic_panel(img_bgr)
+            except Exception as _e:
+                print(f"[fft] forensic_panel error: {_e}")
+
+        # Fallback: simple magnitude heatmap if advanced panel fails
+        if fft_panel_img is None:
+            _, F = fft_features(pil)
+            fig, ax = plt.subplots(figsize=(3,3))
+            im = ax.imshow(np.log(F + 1e-3), cmap="inferno")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("Log |FFT|", fontsize=8)
+            sbuf = io.BytesIO()
+            plt.tight_layout(pad=0.5)
+            plt.savefig(sbuf, format="png")
+            plt.close(fig)
+            sbuf.seek(0)
+            fft_panel_img = Image.open(sbuf)
 
         # --------------------------------------------------------
         #                    Heatmap overlay
         # --------------------------------------------------------
         heatmap_img = (
             make_heatmap_overlay(pil, grid_scores)
-            if grid_scores is not None else spectrum_img
+            if grid_scores is not None else pil
         )
 
         # --------------------------------------------------------
@@ -2247,25 +3447,53 @@ def predict(image):
         # --------------------------------------------------------
         #                  HTML SUMMARY OUTPUT
         # --------------------------------------------------------
-        bar_color = "#ff6b6b" if label=="FAKE" else "#6ef3a5"
+        bar_color = (
+            "#6ef3a5" if label == "REAL"
+            else "#ffd666" if label in ("RBR", "RETOUCHED_REAL", "TAMPERED")
+            else "#ff6b6b"
+        )
         moe_text = f"{p_moe:.1%}" if p_moe is not None else "n/a"
         forensic_text = f"{forensic_val:.2f}" if forensic_val is not None else "n/a"
         cfa_text = f"{cfa_fake_score:.2f}" if cfa_fake_score is not None else "n/a"
         perlin_text = f"{perlin_score:.2f}" if perlin_score is not None else "n/a"
         texture_noise_text = f"{texture_noise:.2f}" if texture_noise is not None else "n/a"
         spectral_text = f"{spectral_score:.2f}" if spectral_score is not None else "n/a"
-        edge_text = f"{edge_score:.2f}" if edge_score is not None else "n/a"
         color_text = f"{color_score:.2f}" if color_score is not None else "n/a"
+        asym_text = f"{asym_score:.2f}" if asym_score is not None else "n/a"
+        real_prior_text = f"{real_prior:.2f}" if real_prior is not None else "n/a"
+        real_prior_v3_text = f"{real_prior_v3_val:.2f}" if real_prior_v3_val is not None else "n/a"
+        grain_text = f"{grain_real:.2f}" if grain_real is not None else "n/a"
+        fft_conf_text = f"{fft_conf_real:.2f}" if fft_conf_real is not None else "n/a"
+        hc_text = f"{hc_score:.2f}" if hc_score is not None else "n/a"
+        # Numeric code for tri-label (REAL=0, TAMPERED=0.5, FAKE=1)
+        if label == "REAL":
+            label_code = 0.0
+        elif label in ("RBR", "RETOUCHED_REAL", "TAMPERED"):
+            label_code = 0.5
+        elif label == "FAKE":
+            label_code = 1.0
+        else:
+            label_code = None
+
+        # Human-readable title for prediction (REAL / TAMPERED / FAKE)
+        if label == "REAL":
+            display_label = "REAL (camera-native)"
+        elif label in ("RBR", "RETOUCHED_REAL", "TAMPERED"):
+            display_label = "TAMPERED (AI-enhanced / edited real photo)"
+        else:
+            display_label = "FAKE (synthetic / deepfake)"
+
         certainty_warning = (
             "<br><b>WARNING: Low certainty (<20%) - manual review recommended.</b>"
             if certainty < 0.20
             else ""
         )
+        code_str = f" &nbsp;|&nbsp; Code: {label_code}" if label_code is not None else ""
         html = (
-            f"<span style='color:{bar_color};font-weight:bold'>Prediction: {label}</span>"
+            f"<span style='color:{bar_color};font-weight:bold'>Prediction: {display_label}</span>"
             f" &nbsp;|&nbsp; Band: <span style='color:{band_color};font-weight:bold'>{band_text}</span>"
             f"<br>Risk level: {risk_level}"
-            f"<br>Global prob: {p_global:.1%} &nbsp;|&nbsp; Final blended: {p_enhanced:.1%}"
+            f"<br>Global prob: {p_global:.1%} &nbsp;|&nbsp; Final blended: {p_enhanced:.1%}{code_str}"
             f"<br>Max patch: {p_patch_max:.1%} (mean {p_patch_mean:.1%}, spread {p_patch_spread:.1%})"
             f"<br>Visual head: {visual_prob:.1%} &nbsp;|&nbsp; Freq head: {freq_prob:.1%}"
             f"<br>MoE fusion: {moe_text}"
@@ -2274,8 +3502,13 @@ def predict(image):
             f"<br>Perlin diffusion score: {perlin_text} (0=real, 1=fake)"
             f"<br>Texture/noise score: {texture_noise_text} (0=real, 1=fake)"
             f"<br>Spectral flatness: {spectral_text} (0=real, 1=fake)"
-            f"<br>Edge continuity: {edge_text} (0=real, 1=fake)"
             f"<br>Color correlation: {color_text} (0=real, 1=fake)"
+            f"<br>Asymmetry score: {asym_text} (0=real, 1=fake)"
+            f"<br>Real prior (combined): {real_prior_text} (0=fake, 1=real)"
+            f"<br>Real prior v3: {real_prior_v3_text} (0=fake, 1=real)"
+            f"<br>Grain likelihood: {grain_text} (0=fake, 1=real)"
+            f"<br>Multiscale FFT confidence: {fft_conf_text} (0=fake, 1=real)"
+            f"<br>Histogram consistency: {hc_text} (0=consistent, 1=anomalous)"
             f"<br>JPEG residual: {jpeg_score:.4f} &nbsp;|&nbsp; Embedding anomaly: {embed_score:.3f}"
             f"<br>Sharpness: {sharpness:.1f} &nbsp;|&nbsp; Head Delta: {head_delta:.3f}"
             f"<br>Certainty: {certainty:.1%}"
@@ -2286,6 +3519,9 @@ def predict(image):
             "<br><small>Note: This is a forensic risk estimate only - use context & provenance.</small>"
         )
 
+        # Append human-readable confidence text
+        html += "<br><b>" + confidence_text(certainty) + "</b>"
+
         # --------------------------------------------------------
         #                   JSON SUMMARY REPORT
         # --------------------------------------------------------
@@ -2295,14 +3531,31 @@ def predict(image):
             "risk_level": risk_level,
             "final_prob": float(p_enhanced),
             "global_prob": float(p_global),
+            "prediction_code": float(label_code) if label_code is not None else None,
             "certainty": float(certainty),
             "forensic_score": float(forensic_val) if forensic_val is not None else None,
             "perlin_score": float(perlin_score) if perlin_score is not None else None,
             "texture_noise_score": float(texture_noise) if texture_noise is not None else None,
             "cfa_fake_score": float(cfa_fake_score) if cfa_fake_score is not None else None,
             "spectral_flatness_score": float(spectral_score),
-            "edge_continuity_score": float(edge_score),
             "color_correlation_score": float(color_score),
+            "asymmetry_score": float(asym_score) if asym_score is not None else None,
+            "real_prior_v2": float(real_prior) if real_prior is not None else None,
+            "real_image_prior_v2": float(real_prior_alt) if real_prior_alt is not None else None,
+            "real_image_prior_v3": float(real_prior_v3_val) if real_prior_v3_val is not None else None,
+            "real_image_prior_v4": float(real_prior_v4) if real_prior_v4 is not None else None,
+            "prnu_strength_raw": float(prnu_val_raw),
+            "prnu_strength_scaled": float(prnu_scaled),
+            "prnu_fft_consistency": float(prnu_fft_cons),
+            "jpeg_residual_v3": float(jpeg_resid_v3) if jpeg_resid_v3 is not None else None,
+            "grain_likelihood": float(grain_real) if grain_real is not None else None,
+            "multiscale_fft_confidence": float(fft_conf_real) if fft_conf_real is not None else None,
+            "histogram_consistency": float(hc_score) if hc_score is not None else None,
+            "esrgan_grid_score": float(esrgan_score) if esrgan_score is not None else None,
+            "saturation_peak_score": float(sat_peak) if sat_peak is not None else None,
+            "jpeg_q_mismatch_score": float(jpeg_q_score) if jpeg_q_score is not None else None,
+            "face_retouch_score": float(face_retouch) if face_retouch is not None else None,
+            "exposure_score": float(exposure_score) if exposure_score is not None else None,
             "patch_max": float(p_patch_max),
             "patch_mean": float(p_patch_mean),
             "visual_head": float(visual_prob),
@@ -2321,6 +3574,7 @@ def predict(image):
 
         llm_metrics = {
             "prediction": label,
+            "prediction_code": float(label_code) if label_code is not None else None,
             "final_prob": float(p_enhanced),
             "global_prob": float(p_global),
             "fusion_prob": float(fusion_prob),
@@ -2336,8 +3590,24 @@ def predict(image):
             "texture_noise_score": float(texture_noise) if texture_noise is not None else None,
             "cfa_fake_score": float(cfa_fake_score) if cfa_fake_score is not None else None,
             "spectral_flatness_score": float(spectral_score),
-            "edge_continuity_score": float(edge_score),
             "color_correlation_score": float(color_score),
+            "asymmetry_score": float(asym_score) if asym_score is not None else None,
+            "real_prior_v2": float(real_prior) if real_prior is not None else None,
+            "real_image_prior_v2": float(real_prior_alt) if real_prior_alt is not None else None,
+            "real_image_prior_v3": float(real_prior_v3_val) if real_prior_v3_val is not None else None,
+            "real_image_prior_v4": float(real_prior_v4) if real_prior_v4 is not None else None,
+            "prnu_strength_raw": float(prnu_val_raw),
+            "prnu_strength_scaled": float(prnu_scaled),
+            "prnu_fft_consistency": float(prnu_fft_cons),
+            "jpeg_residual_v3": float(jpeg_resid_v3) if jpeg_resid_v3 is not None else None,
+            "grain_likelihood": float(grain_real) if grain_real is not None else None,
+            "multiscale_fft_confidence": float(fft_conf_real) if fft_conf_real is not None else None,
+            "histogram_consistency": float(hc_score) if hc_score is not None else None,
+            "esrgan_grid_score": float(esrgan_score) if esrgan_score is not None else None,
+            "saturation_peak_score": float(sat_peak) if sat_peak is not None else None,
+            "jpeg_q_mismatch_score": float(jpeg_q_score) if jpeg_q_score is not None else None,
+            "face_retouch_score": float(face_retouch) if face_retouch is not None else None,
+            "exposure_score": float(exposure_score) if exposure_score is not None else None,
             "patch_max": float(p_patch_max),
             "patch_mean": float(p_patch_mean),
             "patch_spread": float(p_patch_spread),
@@ -2354,21 +3624,30 @@ def predict(image):
 
         report_str = _json.dumps(report, indent=2)
 
-        return html, heatmap_img, jitter_img, report_str, explanation
+        return html, heatmap_img, fft_panel_img, jitter_img, report_str, explanation
 
 # ============================================================
 #                        GRADIO UI
 # ============================================================
 
 def clear_all():
-    return None, "", None, None, "", ""
+    return None, "", None, None, None, "", ""
 
 with gr.Blocks(css=".output-image {transition:opacity 0.3s;}") as demo:
-    gr.Markdown("### Deepfake Detector v4.3.1 - Balanced")
+    gr.Markdown("### Deepfake Detector v4.4 — REAL / TAMPERED / FAKE Classification")
     gr.Markdown(
-        "Improved SigLIP + FFT/SRM fusion with balanced sensitivity. "
-        "Includes TTA, patch-grid heatmaps, JPEG residual, embedding anomaly, "
-        "texture/sharpness checks, and uncertainty states."
+        "This upgraded version provides **three clean final outcomes**:\n"
+        "**REAL**, **TAMPERED** (AI-enhanced, AI-upscaled, or cosmetically edited real images), "
+        "and **FAKE** (fully AI-generated or deepfake).\n\n"
+        "Powered by **SigLIP + Frequency MLP + CORAL calibration**, plus a full **Forensic v4 Suite** including:\n"
+        "- FFT magnitude/phase, SRM residuals, PRNU autocorrelation\n"
+        "- CFA Bayer consistency, JPEG 8×8 block coherence\n"
+        "- High-frequency phase randomness, grain likelihood, patch FFT anomaly maps\n"
+        "- Multicrop inference, TTA, patch-grid heatmaps\n"
+        "- Texture/noise modeling, embedding anomaly, spectral flatness, diffusion trace detectors\n\n"
+        "This version is optimized for **balanced sensitivity**, reduced false positives, "
+        "accurate detection of **AI-retouched real photos**, and robust separation between "
+        "**REAL / TAMPERED / FAKE**."
     )
 
     with gr.Row():
@@ -2383,6 +3662,7 @@ with gr.Blocks(css=".output-image {transition:opacity 0.3s;}") as demo:
             explanation_out = gr.Markdown(label="AI Explanation (DeepSeek)")
             with gr.Row():
                 heatmap_out = gr.Image(label="Suspicious Region Map")
+                fft_out = gr.Image(label="FFT / Forensic Panel (9-Map)")
                 jitter_out = gr.Image(label="Jitter Preview")
             with gr.Accordion("JSON Report (detailed)", open=False):
                 json_out = gr.Textbox(label=None, lines=8)
@@ -2390,12 +3670,12 @@ with gr.Blocks(css=".output-image {transition:opacity 0.3s;}") as demo:
     btn_run.click(
         predict,
         inputs=image_in,
-        outputs=[result_out, heatmap_out, jitter_out, json_out, explanation_out],
+        outputs=[result_out, heatmap_out, fft_out, jitter_out, json_out, explanation_out],
     )
     btn_clear.click(
         fn=clear_all,
         inputs=None,
-        outputs=[image_in, result_out, heatmap_out, jitter_out, json_out, explanation_out],
+        outputs=[image_in, result_out, heatmap_out, fft_out, jitter_out, json_out, explanation_out],
     )
 
 # Optional: guard get_api_info to avoid older gradio_client schema bugs
