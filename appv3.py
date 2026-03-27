@@ -1,8 +1,9 @@
-import os, io, math, numpy as np, torch, torch.nn as nn
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+import asyncio, os, io, math, base64, shutil, tempfile, numpy as np, torch, torch.nn as nn
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Sequence, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from urllib.parse import urlparse
 import pywt
 import cv2
 from scipy.ndimage import gaussian_filter
@@ -44,6 +45,10 @@ try:
     import requests
 except Exception:
     requests = None
+try:
+    import yt_dlp
+except Exception:
+    yt_dlp = None
 try:
     import xgboost as xgb
 except Exception:
@@ -92,6 +97,121 @@ except Exception as _e:
 # Stable plotting backend
 matplotlib.use("Agg", force=True)
 
+# ============================================================
+#                 INLINED SORA LOGIC HELPERS
+# ============================================================
+
+SignalRow = Tuple[str, Optional[float], float]
+
+
+def sora_clip01(value: Optional[float], default: Optional[float] = None) -> Optional[float]:
+    if value is None:
+        return default
+    try:
+        v = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(v):
+        return default
+    return min(1.0, max(0.0, v))
+
+
+def compute_weighted_signal_score(
+    signals: Sequence[SignalRow],
+    coverage_power: float = 0.70,
+) -> Tuple[float, int, float]:
+    total = len(signals)
+    if total <= 0:
+        return 0.0, 0, 0.0
+
+    pairs = []
+    for _name, value, weight in signals:
+        v = sora_clip01(value)
+        if v is None:
+            continue
+        try:
+            w = float(weight)
+        except Exception:
+            continue
+        if not math.isfinite(w) or w <= 0.0:
+            continue
+        pairs.append((v, w))
+
+    valid = len(pairs)
+    coverage = float(valid / total)
+    if valid == 0:
+        return 0.0, 0, coverage
+
+    w_sum = sum(w for _, w in pairs)
+    raw = sum(v * w for v, w in pairs) / max(1e-6, w_sum)
+    p = float(max(0.0, coverage_power))
+    score = raw * (coverage ** p)
+    return min(1.0, max(0.0, score)), valid, coverage
+
+
+def has_sora_evidence(
+    valid_signals: int,
+    coverage: float,
+    min_valid_signals: int,
+    min_coverage: float,
+) -> bool:
+    min_valid = max(1, int(min_valid_signals))
+    cov = sora_clip01(coverage, default=0.0)
+    cov_min = sora_clip01(min_coverage, default=0.0)
+    return bool(valid_signals >= min_valid and cov >= cov_min)
+
+
+def is_signal_hit(value: Optional[float], threshold: float) -> int:
+    v = sora_clip01(value)
+    if v is None:
+        return 0
+    return int(v > float(threshold))
+
+
+def _sora_odds(p: float) -> float:
+    p = sora_clip01(p, default=0.5)
+    p = min(1.0 - 1e-6, max(1e-6, p))
+    return p / (1.0 - p)
+
+
+def _sora_from_odds(odds: float) -> float:
+    try:
+        o = float(odds)
+    except Exception:
+        return 0.5
+    if not math.isfinite(o):
+        return 0.5
+    if o <= 0.0:
+        return 0.0
+    return o / (1.0 + o)
+
+
+def apply_sora_adjustment(
+    video_prob: float,
+    video_label: str,
+    sora_likelihood: float,
+    sora_flag: bool,
+    evidence_ok: bool,
+    tampered_thresh: float,
+    odds_high: float,
+) -> Tuple[float, str]:
+    p = sora_clip01(video_prob, default=0.5)
+    label = collapse_binary_label(video_label, p)
+    sora = sora_clip01(sora_likelihood, default=0.0)
+
+    if evidence_ok and sora >= tampered_thresh:
+        odds = _sora_odds(p)
+        odds *= max(1.0, float(odds_high))
+        p = _sora_from_odds(odds)
+
+    if evidence_ok:
+        if sora_flag:
+            label = "FAKE"
+        elif sora >= tampered_thresh and p >= 0.60:
+            label = "FAKE"
+
+    return float(sora_clip01(p, default=0.5)), label
+
 torch.set_grad_enabled(False)
 torch.set_num_threads(2)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -120,114 +240,209 @@ if grc_utils is not None and hasattr(grc_utils, "json_schema_to_python_type"):
 #          HUGGING FACE MODEL REPO + CONFIG
 # ============================================================
 
-MODEL_REPO = "joesound212985/siglip"   # Must contain best_model.safetensors + freq_mlp.safetensors + CORAL files
-CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/hf-cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-HF_TOKEN = os.getenv("HF_TOKEN")
-# Optional runtime toggles (no re-training required)
-DETECT_USE_CLAHE = os.getenv("DETECT_USE_CLAHE", "0").strip() in {"1","true","True"}
-DETECT_USE_FUSION = os.getenv("DETECT_USE_FUSION", "1").strip() in {"1","true","True"}
-DETECT_USE_STABILIZER = os.getenv("DETECT_USE_STABILIZER", "1").strip() in {"1","true","True"}
-DETECT_USE_FORENSICS = os.getenv("DETECT_USE_FORENSICS", "1").strip() in {"1","true","True"}
-DETECT_EXTRA_TTA = os.getenv("DETECT_EXTRA_TTA", "0").strip() in {"1","true","True"}
-DETECT_MAX_VIDEO_FRAMES = int(os.getenv("DETECT_MAX_VIDEO_FRAMES", "12"))
-VIDEO_SCENE_DETECT = os.getenv("VIDEO_SCENE_DETECT", "1").strip() in {"1","true","True"}
-VIDEO_ADAPTIVE_SAMPLE = os.getenv("VIDEO_ADAPTIVE_SAMPLE", "1").strip() in {"1","true","True"}
-SCENE_DETECT_STRIDE = int(os.getenv("SCENE_DETECT_STRIDE", "4"))
-SCENE_DETECT_MAX_SAMPLES = int(os.getenv("SCENE_DETECT_MAX_SAMPLES", "600"))
-SCENE_CUT_THRESH = float(os.getenv("SCENE_CUT_THRESH", "0.45"))
-ADAPTIVE_SAMPLE_RATIO = float(os.getenv("ADAPTIVE_SAMPLE_RATIO", "0.50"))
-DISABLE_TAMPERED = os.getenv("DISABLE_TAMPERED", "0").strip() in {"1","true","True"}
-DISABLE_INCONCLUSIVE = os.getenv("DISABLE_INCONCLUSIVE", "0").strip() in {"1","true","True"}
-try:
-    FINAL_REAL_THRESH = float(os.getenv("FINAL_REAL_THRESH", "0.45"))
-except Exception:
-    FINAL_REAL_THRESH = 0.45
-try:
-    FINAL_FAKE_THRESH = float(os.getenv("FINAL_FAKE_THRESH", "0.75"))
-except Exception:
-    FINAL_FAKE_THRESH = 0.75
-if not (0.0 < FINAL_REAL_THRESH < FINAL_FAKE_THRESH < 1.0):
-    FINAL_REAL_THRESH, FINAL_FAKE_THRESH = 0.45, 0.75
-try:
-    FINAL_LOGIT_SHRINK = float(os.getenv("FINAL_LOGIT_SHRINK", "0.85"))
-except Exception:
-    FINAL_LOGIT_SHRINK = 0.85
-FINAL_LOGIT_SHRINK = max(0.5, min(1.0, FINAL_LOGIT_SHRINK))
-try:
-    CFA_WEIGHT = float(os.getenv("CFA_WEIGHT", "0.6"))
-except Exception:
-    CFA_WEIGHT = 0.6
-CFA_WEIGHT = max(0.0, min(1.0, CFA_WEIGHT))
-try:
-    SORA_TAMPERED_THRESH = float(os.getenv("SORA_TAMPERED_THRESH", "0.15"))
-except Exception:
-    SORA_TAMPERED_THRESH = 0.15
-try:
-    SORA_FAKE_THRESH = float(os.getenv("SORA_FAKE_THRESH", "0.20"))
-except Exception:
-    SORA_FAKE_THRESH = 0.20
-try:
-    SORA_MIN_FAKE_PROB = float(os.getenv("SORA_MIN_FAKE_PROB", "0.40"))
-except Exception:
-    SORA_MIN_FAKE_PROB = 0.40
-try:
-    SORA_ODDS_LOW = float(os.getenv("SORA_ODDS_LOW", "1.12"))
-except Exception:
-    SORA_ODDS_LOW = 1.12
-try:
-    SORA_ODDS_MED = float(os.getenv("SORA_ODDS_MED", "1.25"))
-except Exception:
-    SORA_ODDS_MED = 1.25
-try:
-    SORA_ODDS_HIGH = float(os.getenv("SORA_ODDS_HIGH", "1.45"))
-except Exception:
-    SORA_ODDS_HIGH = 1.45
-try:
-    IMAGE_GEN_TAMPERED_THRESH = float(os.getenv("IMAGE_GEN_TAMPERED_THRESH", "0.45"))
-except Exception:
-    IMAGE_GEN_TAMPERED_THRESH = 0.45
-try:
-    IMAGE_GEN_FAKE_THRESH = float(os.getenv("IMAGE_GEN_FAKE_THRESH", "0.70"))
-except Exception:
-    IMAGE_GEN_FAKE_THRESH = 0.70
-try:
-    IMAGE_GEN_MIN_FAKE_PROB = float(os.getenv("IMAGE_GEN_MIN_FAKE_PROB", "0.50"))
-except Exception:
-    IMAGE_GEN_MIN_FAKE_PROB = 0.50
-try:
-    IMAGE_GEN_ODDS_LOW = float(os.getenv("IMAGE_GEN_ODDS_LOW", "1.06"))
-except Exception:
-    IMAGE_GEN_ODDS_LOW = 1.06
-try:
-    IMAGE_GEN_ODDS_MED = float(os.getenv("IMAGE_GEN_ODDS_MED", "1.12"))
-except Exception:
-    IMAGE_GEN_ODDS_MED = 1.12
-try:
-    IMAGE_GEN_ODDS_HIGH = float(os.getenv("IMAGE_GEN_ODDS_HIGH", "1.20"))
-except Exception:
-    IMAGE_GEN_ODDS_HIGH = 1.20
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
-SORA_TAMPERED_THRESH = float(np.clip(SORA_TAMPERED_THRESH, 0.10, 0.95))
-SORA_FAKE_THRESH = float(np.clip(SORA_FAKE_THRESH, 0.20, 0.98))
-if SORA_FAKE_THRESH <= SORA_TAMPERED_THRESH:
-    SORA_FAKE_THRESH = min(0.98, SORA_TAMPERED_THRESH + 0.20)
-SORA_MIN_FAKE_PROB = float(np.clip(SORA_MIN_FAKE_PROB, 0.20, 0.90))
-SORA_ODDS_LOW = float(np.clip(SORA_ODDS_LOW, 1.0, 2.0))
-SORA_ODDS_MED = float(np.clip(SORA_ODDS_MED, 1.0, 2.5))
-SORA_ODDS_HIGH = float(np.clip(SORA_ODDS_HIGH, 1.0, 3.0))
-IMAGE_GEN_TAMPERED_THRESH = float(np.clip(IMAGE_GEN_TAMPERED_THRESH, 0.10, 0.95))
-IMAGE_GEN_FAKE_THRESH = float(np.clip(IMAGE_GEN_FAKE_THRESH, 0.20, 0.98))
-if IMAGE_GEN_FAKE_THRESH <= IMAGE_GEN_TAMPERED_THRESH:
-    IMAGE_GEN_FAKE_THRESH = min(0.98, IMAGE_GEN_TAMPERED_THRESH + 0.15)
-IMAGE_GEN_MIN_FAKE_PROB = float(np.clip(IMAGE_GEN_MIN_FAKE_PROB, 0.20, 0.90))
-IMAGE_GEN_ODDS_LOW = float(np.clip(IMAGE_GEN_ODDS_LOW, 1.0, 2.0))
-IMAGE_GEN_ODDS_MED = float(np.clip(IMAGE_GEN_ODDS_MED, 1.0, 2.5))
-IMAGE_GEN_ODDS_HIGH = float(np.clip(IMAGE_GEN_ODDS_HIGH, 1.0, 3.0))
-SCENE_DETECT_STRIDE = max(1, SCENE_DETECT_STRIDE)
-SCENE_DETECT_MAX_SAMPLES = max(50, SCENE_DETECT_MAX_SAMPLES)
-SCENE_CUT_THRESH = float(np.clip(SCENE_CUT_THRESH, 0.10, 0.90))
-ADAPTIVE_SAMPLE_RATIO = float(np.clip(ADAPTIVE_SAMPLE_RATIO, 0.30, 0.80))
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+@dataclass
+class DetectorConfig:
+    model_repo: str = os.getenv("MODEL_REPO", "joesound212985/siglip")
+    cache_dir: str = os.getenv("CACHE_DIR", "/tmp/hf-cache")
+    hf_token: str = os.getenv("HF_TOKEN")
+    detect_use_clahe: bool = field(default_factory=lambda: _env_bool("DETECT_USE_CLAHE", "0"))
+    detect_use_fusion: bool = field(default_factory=lambda: _env_bool("DETECT_USE_FUSION", "1"))
+    detect_use_stabilizer: bool = field(default_factory=lambda: _env_bool("DETECT_USE_STABILIZER", "1"))
+    detect_use_forensics: bool = field(default_factory=lambda: _env_bool("DETECT_USE_FORENSICS", "1"))
+    detect_extra_tta: bool = field(default_factory=lambda: _env_bool("DETECT_EXTRA_TTA", "0"))
+    detect_max_video_frames: int = field(default_factory=lambda: _env_int("DETECT_MAX_VIDEO_FRAMES", 12))
+    detect_video_workers: int = field(default_factory=lambda: _env_int("DETECT_VIDEO_WORKERS", 2))
+    video_scene_detect: bool = field(default_factory=lambda: _env_bool("VIDEO_SCENE_DETECT", "1"))
+    video_adaptive_sample: bool = field(default_factory=lambda: _env_bool("VIDEO_ADAPTIVE_SAMPLE", "1"))
+    scene_detect_stride: int = field(default_factory=lambda: _env_int("SCENE_DETECT_STRIDE", 4))
+    scene_detect_max_samples: int = field(default_factory=lambda: _env_int("SCENE_DETECT_MAX_SAMPLES", 600))
+    scene_cut_thresh: float = field(default_factory=lambda: _env_float("SCENE_CUT_THRESH", 0.45))
+    adaptive_sample_ratio: float = field(default_factory=lambda: _env_float("ADAPTIVE_SAMPLE_RATIO", 0.50))
+    url_download_max_mb: int = field(default_factory=lambda: _env_int("URL_DOWNLOAD_MAX_MB", 400))
+    url_download_timeout: int = field(default_factory=lambda: _env_int("URL_DOWNLOAD_TIMEOUT", 120))
+    ytdlp_cookies_file: str = field(default_factory=lambda: os.getenv("YTDLP_COOKIES_FILE", "").strip())
+    ytdlp_cookies_txt: str = field(default_factory=lambda: os.getenv("YTDLP_COOKIES_TXT", "").strip())
+    ytdlp_cookies_b64: str = field(default_factory=lambda: os.getenv("YTDLP_COOKIES_B64", "").strip())
+    ytdlp_player_client: str = field(default_factory=lambda: os.getenv("YTDLP_PLAYER_CLIENT", "android").strip().lower())
+    disable_tampered: bool = field(default_factory=lambda: _env_bool("DISABLE_TAMPERED", "0"))
+    disable_inconclusive: bool = field(default_factory=lambda: _env_bool("DISABLE_INCONCLUSIVE", "0"))
+    final_real_thresh: float = field(default_factory=lambda: _env_float("FINAL_REAL_THRESH", 0.40))
+    final_fake_thresh: float = field(default_factory=lambda: _env_float("FINAL_FAKE_THRESH", 0.60))
+    final_logit_shrink: float = field(default_factory=lambda: _env_float("FINAL_LOGIT_SHRINK", 0.85))
+    final_threshold: float = field(default_factory=lambda: _env_float("FINAL_THRESHOLD", 0.52))
+    cfa_weight: float = field(default_factory=lambda: _env_float("CFA_WEIGHT", 0.6))
+    sora_tampered_thresh: float = field(default_factory=lambda: _env_float("SORA_TAMPERED_THRESH", 0.15))
+    sora_fake_thresh: float = field(default_factory=lambda: _env_float("SORA_FAKE_THRESH", 0.15))
+    sora_odds_high: float = field(default_factory=lambda: _env_float("SORA_ODDS_HIGH", 2.5))
+    sora_min_signal_coverage: float = field(default_factory=lambda: _env_float("SORA_MIN_SIGNAL_COVERAGE", 0.40))
+    sora_min_valid_signals: int = field(default_factory=lambda: _env_int("SORA_MIN_VALID_SIGNALS", 5))
+    sora_coverage_power: float = field(default_factory=lambda: _env_float("SORA_COVERAGE_POWER", 0.70))
+    sora_flag_prob_thresh: float = field(default_factory=lambda: _env_float("SORA_FLAG_PROB_THRESH", 0.45))
+    sora_flag_strong_prob_thresh: float = field(default_factory=lambda: _env_float("SORA_FLAG_STRONG_PROB_THRESH", 0.60))
+    sora_core_hit_thresh: float = field(default_factory=lambda: _env_float("SORA_CORE_HIT_THRESH", 0.50))
+    sora_motion_hit_thresh: float = field(default_factory=lambda: _env_float("SORA_MOTION_HIT_THRESH", 0.55))
+    sora_flag_core_hits: int = field(default_factory=lambda: _env_int("SORA_FLAG_CORE_HITS", 2))
+    sora_flag_motion_hits: int = field(default_factory=lambda: _env_int("SORA_FLAG_MOTION_HITS", 1))
+    video_max_scenes: int = field(default_factory=lambda: _env_int("VIDEO_MAX_SCENES", 3))
+    image_gen_tampered_thresh: float = field(default_factory=lambda: _env_float("IMAGE_GEN_TAMPERED_THRESH", 0.45))
+    image_gen_fake_thresh: float = field(default_factory=lambda: _env_float("IMAGE_GEN_FAKE_THRESH", 0.70))
+    image_gen_min_fake_prob: float = field(default_factory=lambda: _env_float("IMAGE_GEN_MIN_FAKE_PROB", 0.50))
+    image_gen_odds_low: float = field(default_factory=lambda: _env_float("IMAGE_GEN_ODDS_LOW", 1.06))
+    image_gen_odds_med: float = field(default_factory=lambda: _env_float("IMAGE_GEN_ODDS_MED", 1.12))
+    image_gen_odds_high: float = field(default_factory=lambda: _env_float("IMAGE_GEN_ODDS_HIGH", 1.20))
+    real_ref_dir: str = os.getenv("REAL_REF_DIR")
+    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL") or os.getenv("HF_LLM_MODEL") or "meta-llama/Meta-Llama-3.1-70B-Instruct")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY")
+    hf_llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY"))
+    llm_fallback_model: str = field(default_factory=lambda: os.getenv("LLM_FALLBACK_MODEL") or "Qwen/Qwen2.5-7B-Instruct")
+    llm_enabled: bool = field(default_factory=lambda: _env_bool("LLM_ENABLED", "1"))
+    llm_max_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_TOKENS", 220))
+    llm_temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.2))
+    llm_timeout: float = field(default_factory=lambda: _env_float("LLM_TIMEOUT", 20.0))
+    llm_base_url: str = field(default_factory=lambda: os.getenv("LLM_BASE_URL") or os.getenv("HF_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "")
+
+    def __post_init__(self):
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.detect_max_video_frames = max(1, min(64, int(self.detect_max_video_frames)))
+        self.detect_video_workers = max(1, min(8, int(self.detect_video_workers)))
+        self.scene_detect_stride = max(1, int(self.scene_detect_stride))
+        self.scene_detect_max_samples = max(50, int(self.scene_detect_max_samples))
+        self.scene_cut_thresh = float(np.clip(self.scene_cut_thresh, 0.10, 0.90))
+        self.adaptive_sample_ratio = float(np.clip(self.adaptive_sample_ratio, 0.30, 0.80))
+        self.url_download_max_mb = int(np.clip(self.url_download_max_mb, 25, 2000))
+        self.url_download_timeout = int(np.clip(self.url_download_timeout, 15, 600))
+        self.url_download_max_bytes = int(self.url_download_max_mb * 1024 * 1024)
+        if self.ytdlp_player_client not in {"android", "web", "ios", "mweb"}:
+            self.ytdlp_player_client = "android"
+
+        self.final_real_thresh = float(np.clip(self.final_real_thresh, 0.01, 0.99))
+        self.final_fake_thresh = float(np.clip(self.final_fake_thresh, 0.01, 0.99))
+        if self.final_fake_thresh < self.final_real_thresh:
+            midpoint = float(np.clip((self.final_real_thresh + self.final_fake_thresh) * 0.5, 0.01, 0.99))
+            self.final_real_thresh = midpoint
+            self.final_fake_thresh = midpoint
+        self.final_logit_shrink = float(np.clip(self.final_logit_shrink, 0.5, 1.0))
+        self.final_threshold = float(np.clip(self.final_threshold, 0.05, 0.99))
+        self.cfa_weight = float(np.clip(self.cfa_weight, 0.0, 1.0))
+
+        self.sora_tampered_thresh = float(np.clip(self.sora_tampered_thresh, 0.05, 0.95))
+        self.sora_fake_thresh = float(np.clip(self.sora_fake_thresh, 0.05, 0.98))
+        if self.sora_fake_thresh < self.sora_tampered_thresh:
+            self.sora_fake_thresh = self.sora_tampered_thresh
+        self.sora_odds_high = float(np.clip(self.sora_odds_high, 1.0, 10.0))
+        self.sora_min_signal_coverage = float(np.clip(self.sora_min_signal_coverage, 0.10, 1.0))
+        self.sora_min_valid_signals = max(1, int(self.sora_min_valid_signals))
+        self.sora_coverage_power = float(np.clip(self.sora_coverage_power, 0.0, 2.0))
+        self.sora_flag_prob_thresh = float(np.clip(self.sora_flag_prob_thresh, 0.05, 0.95))
+        self.sora_flag_strong_prob_thresh = float(np.clip(self.sora_flag_strong_prob_thresh, 0.05, 0.98))
+        self.sora_core_hit_thresh = float(np.clip(self.sora_core_hit_thresh, 0.05, 0.95))
+        self.sora_motion_hit_thresh = float(np.clip(self.sora_motion_hit_thresh, 0.05, 0.98))
+        self.sora_flag_core_hits = max(1, int(self.sora_flag_core_hits))
+        self.sora_flag_motion_hits = max(1, int(self.sora_flag_motion_hits))
+
+        self.video_max_scenes = max(1, min(5, int(self.video_max_scenes)))
+        self.image_gen_tampered_thresh = float(np.clip(self.image_gen_tampered_thresh, 0.10, 0.95))
+        self.image_gen_fake_thresh = float(np.clip(self.image_gen_fake_thresh, 0.20, 0.98))
+        if self.image_gen_fake_thresh <= self.image_gen_tampered_thresh:
+            self.image_gen_fake_thresh = min(0.98, self.image_gen_tampered_thresh + 0.15)
+        self.image_gen_min_fake_prob = float(np.clip(self.image_gen_min_fake_prob, 0.20, 0.90))
+        self.image_gen_odds_low = float(np.clip(self.image_gen_odds_low, 1.0, 2.0))
+        self.image_gen_odds_med = float(np.clip(self.image_gen_odds_med, 1.0, 2.5))
+        self.image_gen_odds_high = float(np.clip(self.image_gen_odds_high, 1.0, 3.0))
+
+        self.hf_router_enabled = bool(self.hf_llm_api_key or self.hf_token)
+        self.llm_api_key = self.hf_llm_api_key or self.hf_token or self.openai_api_key
+        if not self.llm_base_url:
+            self.llm_base_url = (
+                "https://router.huggingface.co/v1"
+                if self.hf_router_enabled
+                else "https://api.openai.com/v1"
+            )
+
+
+APP_CONFIG = DetectorConfig()
+
+MODEL_REPO = APP_CONFIG.model_repo   # Must contain best_model.safetensors + freq_mlp.safetensors + CORAL files
+CACHE_DIR = APP_CONFIG.cache_dir
+HF_TOKEN = APP_CONFIG.hf_token
+DETECT_USE_CLAHE = APP_CONFIG.detect_use_clahe
+DETECT_USE_FUSION = APP_CONFIG.detect_use_fusion
+DETECT_USE_STABILIZER = APP_CONFIG.detect_use_stabilizer
+DETECT_USE_FORENSICS = APP_CONFIG.detect_use_forensics
+DETECT_EXTRA_TTA = APP_CONFIG.detect_extra_tta
+DETECT_MAX_VIDEO_FRAMES = APP_CONFIG.detect_max_video_frames
+DETECT_VIDEO_WORKERS = APP_CONFIG.detect_video_workers
+VIDEO_SCENE_DETECT = APP_CONFIG.video_scene_detect
+VIDEO_ADAPTIVE_SAMPLE = APP_CONFIG.video_adaptive_sample
+SCENE_DETECT_STRIDE = APP_CONFIG.scene_detect_stride
+SCENE_DETECT_MAX_SAMPLES = APP_CONFIG.scene_detect_max_samples
+SCENE_CUT_THRESH = APP_CONFIG.scene_cut_thresh
+ADAPTIVE_SAMPLE_RATIO = APP_CONFIG.adaptive_sample_ratio
+URL_DOWNLOAD_MAX_MB = APP_CONFIG.url_download_max_mb
+URL_DOWNLOAD_TIMEOUT = APP_CONFIG.url_download_timeout
+URL_DOWNLOAD_MAX_BYTES = APP_CONFIG.url_download_max_bytes
+YTDLP_COOKIES_FILE = APP_CONFIG.ytdlp_cookies_file
+YTDLP_COOKIES_TXT = APP_CONFIG.ytdlp_cookies_txt
+YTDLP_COOKIES_B64 = APP_CONFIG.ytdlp_cookies_b64
+YTDLP_PLAYER_CLIENT = APP_CONFIG.ytdlp_player_client
+DISABLE_TAMPERED = APP_CONFIG.disable_tampered
+DISABLE_INCONCLUSIVE = APP_CONFIG.disable_inconclusive
+FINAL_REAL_THRESH = APP_CONFIG.final_real_thresh
+FINAL_FAKE_THRESH = APP_CONFIG.final_fake_thresh
+FINAL_LOGIT_SHRINK = APP_CONFIG.final_logit_shrink
+CFA_WEIGHT = APP_CONFIG.cfa_weight
+SORA_TAMPERED_THRESH = APP_CONFIG.sora_tampered_thresh
+SORA_FAKE_THRESH = APP_CONFIG.sora_fake_thresh
+SORA_ODDS_HIGH = APP_CONFIG.sora_odds_high
+SORA_MIN_SIGNAL_COVERAGE = APP_CONFIG.sora_min_signal_coverage
+SORA_MIN_VALID_SIGNALS = APP_CONFIG.sora_min_valid_signals
+SORA_COVERAGE_POWER = APP_CONFIG.sora_coverage_power
+SORA_FLAG_PROB_THRESH = APP_CONFIG.sora_flag_prob_thresh
+SORA_FLAG_STRONG_PROB_THRESH = APP_CONFIG.sora_flag_strong_prob_thresh
+SORA_CORE_HIT_THRESH = APP_CONFIG.sora_core_hit_thresh
+SORA_MOTION_HIT_THRESH = APP_CONFIG.sora_motion_hit_thresh
+SORA_FLAG_CORE_HITS = APP_CONFIG.sora_flag_core_hits
+SORA_FLAG_MOTION_HITS = APP_CONFIG.sora_flag_motion_hits
+VIDEO_MAX_SCENES = APP_CONFIG.video_max_scenes
+IMAGE_GEN_TAMPERED_THRESH = APP_CONFIG.image_gen_tampered_thresh
+IMAGE_GEN_FAKE_THRESH = APP_CONFIG.image_gen_fake_thresh
+IMAGE_GEN_MIN_FAKE_PROB = APP_CONFIG.image_gen_min_fake_prob
+IMAGE_GEN_ODDS_LOW = APP_CONFIG.image_gen_odds_low
+IMAGE_GEN_ODDS_MED = APP_CONFIG.image_gen_odds_med
+IMAGE_GEN_ODDS_HIGH = APP_CONFIG.image_gen_odds_high
+
+
+def collapse_binary_label(label: str, prob_fake: Optional[float] = None) -> str:
+    lbl = str(label or "FAKE")
+    if lbl == "REAL":
+        return "REAL"
+    if lbl == "FAKE":
+        return "FAKE"
+    if lbl == "SYNTHETIC":
+        return "FAKE"
+
+    p = sora_clip01(prob_fake)
+    if p is None:
+        return "REAL"
+    return "FAKE" if p >= FINAL_FAKE_THRESH else "REAL"
 
 if HF_TOKEN:
     try:
@@ -243,26 +458,16 @@ else:
 # ============================================================
 
 # Default LLM model for explanations (HF router by default, OpenAI-compatible fallback).
-LLM_MODEL = (
-    os.getenv("LLM_MODEL")
-    or os.getenv("HF_LLM_MODEL")
-    or "meta-llama/Meta-Llama-3.1-70B-Instruct"
-)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_API_KEY = os.getenv("LLM_API_KEY") or HF_TOKEN or OPENAI_API_KEY
-_has_hf_creds = bool(os.getenv("LLM_API_KEY") or HF_TOKEN)
-_default_llm_base = "https://router.huggingface.co/v1" if _has_hf_creds else "https://api.openai.com/v1"
-LLM_BASE_URL = (
-    os.getenv("LLM_BASE_URL")
-    or os.getenv("HF_LLM_BASE_URL")
-    or os.getenv("OPENAI_BASE_URL")
-    or _default_llm_base
-)
-LLM_ENABLED = os.getenv("LLM_ENABLED", "1").strip() in {"1","true","True"}
-LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL") or "Qwen/Qwen2.5-7B-Instruct"
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "220"))
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "20"))
+LLM_MODEL = APP_CONFIG.llm_model
+OPENAI_API_KEY = APP_CONFIG.openai_api_key
+LLM_API_KEY = APP_CONFIG.llm_api_key
+_has_hf_creds = APP_CONFIG.hf_router_enabled
+LLM_BASE_URL = APP_CONFIG.llm_base_url
+LLM_ENABLED = APP_CONFIG.llm_enabled
+LLM_FALLBACK_MODEL = APP_CONFIG.llm_fallback_model
+LLM_MAX_TOKENS = APP_CONFIG.llm_max_tokens
+LLM_TEMPERATURE = APP_CONFIG.llm_temperature
+LLM_TIMEOUT = APP_CONFIG.llm_timeout
 
 _openai_llm_client = None
 if LLM_ENABLED and _OpenAIClient is not None and LLM_API_KEY:
@@ -555,6 +760,10 @@ def load_coral():
 
 CORAL_CUTS, CORAL_TEMP, CORAL_BINS = None, 1.0, None
 CORAL_LOCK = threading.Lock()
+_SIGLIP_MODEL_LOCK = threading.Lock()
+_XGB_MODEL_LOCK = threading.Lock()
+_FREQ_MLP_LOCK = threading.Lock()
+_FUSION_HEAD_LOCK = threading.Lock()
 
 # ============================================================
 #                 DEVICE + CONSTANTS
@@ -600,6 +809,122 @@ def load_image_any(path: str) -> Image.Image:
                 print(f"[decode] imageio AVIF decode failed: {_e}")
         print(f"[decode] PIL load failed: {e}")
         raise
+
+
+_VIDEO_CTX_CACHE = {"key": None, "ctx": None}
+_VIDEO_CTX_LOCK = threading.Lock()
+
+
+def _robust_mean(values, trim: float = 0.10):
+    arr = np.asarray([float(v) for v in values if v is not None and np.isfinite(v)], dtype=np.float32)
+    if arr.size == 0:
+        return None
+    arr = np.sort(arr)
+    if arr.size >= 5 and trim > 0.0:
+        k = int(np.floor(arr.size * trim))
+        if 2 * k < arr.size:
+            arr = arr[k:arr.size - k]
+    if arr.size == 0:
+        return None
+    return float(np.mean(arr))
+
+
+def _build_video_context(frames):
+    if frames is None:
+        return None
+    rgb = []
+    gray = []
+    gray96 = []
+    gray192 = []
+    for f in frames:
+        try:
+            arr = np.asarray(f)
+            if arr is None or arr.size == 0:
+                continue
+            if arr.ndim == 2:
+                arr = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+            elif arr.shape[-1] == 4:
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+            arr = arr.astype(np.uint8, copy=False)
+            g = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            rgb.append(arr)
+            gray.append(g)
+            gray96.append(cv2.resize(g, (96, 96), interpolation=cv2.INTER_AREA))
+            gray192.append(cv2.resize(g, (192, 192), interpolation=cv2.INTER_AREA))
+        except Exception:
+            continue
+    return {
+        "rgb": rgb,
+        "gray": gray,
+        "gray96": gray96,
+        "gray192": gray192,
+    }
+
+
+def _get_video_context(frames):
+    if frames is None:
+        return None
+    key = (id(frames), len(frames))
+    with _VIDEO_CTX_LOCK:
+        if _VIDEO_CTX_CACHE.get("key") == key and _VIDEO_CTX_CACHE.get("ctx") is not None:
+            return _VIDEO_CTX_CACHE["ctx"]
+    ctx = _build_video_context(frames)
+    with _VIDEO_CTX_LOCK:
+        _VIDEO_CTX_CACHE["key"] = key
+        _VIDEO_CTX_CACHE["ctx"] = ctx
+    return ctx
+
+
+def _estimate_global_affine(prev_gray: np.ndarray, curr_gray: np.ndarray):
+    try:
+        p0 = cv2.goodFeaturesToTrack(
+            prev_gray,
+            maxCorners=300,
+            qualityLevel=0.01,
+            minDistance=7,
+            blockSize=7,
+        )
+        if p0 is None or len(p0) < 10:
+            return None
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray,
+            curr_gray,
+            p0,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+        )
+        if p1 is None or st is None:
+            return None
+        st = st.reshape(-1)
+        good = st == 1
+        if int(np.sum(good)) < 10:
+            return None
+        src = p0[good].reshape(-1, 2)
+        dst = p1[good].reshape(-1, 2)
+        M, _ = cv2.estimateAffinePartial2D(
+            src,
+            dst,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+        )
+        return M
+    except Exception:
+        return None
+
+
+def _warp_gray_affine(gray: np.ndarray, M):
+    if M is None:
+        return gray
+    h, w = gray.shape[:2]
+    return cv2.warpAffine(
+        gray,
+        M,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+    )
 
 
 def _quick_gray_hist(gray: np.ndarray) -> np.ndarray:
@@ -648,13 +973,13 @@ def _scan_video_changes(video_path: str):
     return total_frames, sample_idxs, diffs
 
 
-def _pick_primary_scene(total_frames: int, sample_idxs: list, diffs: list):
+def _scene_segments(total_frames: int, sample_idxs: list, diffs: list):
     if total_frames <= 0:
         if sample_idxs:
-            return 0, max(sample_idxs)
-        return 0, 0
+            return [(0, max(sample_idxs))]
+        return [(0, 0)]
     if not sample_idxs:
-        return 0, total_frames - 1
+        return [(0, total_frames - 1)]
 
     diffs_arr = np.asarray(diffs, dtype=np.float32)
     dyn_thresh = float(np.median(diffs_arr) + 2.0 * np.std(diffs_arr))
@@ -670,8 +995,33 @@ def _pick_primary_scene(total_frames: int, sample_idxs: list, diffs: list):
     segments.append((start, total_frames - 1))
     segments = [seg for seg in segments if seg[1] >= seg[0]]
     if not segments:
-        return 0, total_frames - 1
+        return [(0, total_frames - 1)]
+    return segments
+
+
+def _pick_primary_scene(total_frames: int, sample_idxs: list, diffs: list):
+    segments = _scene_segments(total_frames, sample_idxs, diffs)
+    if not segments:
+        return 0, max(0, total_frames - 1)
     return max(segments, key=lambda seg: seg[1] - seg[0])
+
+
+def _allocate_segment_budgets(segments, total_budget: int):
+    if not segments or total_budget <= 0:
+        return []
+    lengths = [max(1, int(end - start + 1)) for start, end in segments]
+    sum_len = float(sum(lengths))
+    budgets = [max(1, int(round(total_budget * (ln / sum_len)))) for ln in lengths]
+    while sum(budgets) > total_budget:
+        idx = int(np.argmax(budgets))
+        if budgets[idx] > 1:
+            budgets[idx] -= 1
+        else:
+            break
+    while sum(budgets) < total_budget:
+        idx = int(np.argmax(lengths))
+        budgets[idx] += 1
+    return budgets
 
 
 def _adaptive_sample_indices(
@@ -732,11 +1082,12 @@ def extract_video_frames(
         return frames
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    idxs = None
+    idxs = []
     scene_start = 0
     scene_end = max(0, total_frames - 1)
     sample_idxs = []
     diffs = []
+    scene_segments = [(scene_start, scene_end)]
 
     if scene_detect is None:
         scene_detect = VIDEO_SCENE_DETECT
@@ -748,15 +1099,69 @@ def extract_video_frames(
     if scene_detect or adaptive_sample:
         total_frames, sample_idxs, diffs = _scan_video_changes(video_path)
         if scene_detect:
-            scene_start, scene_end = _pick_primary_scene(total_frames, sample_idxs, diffs)
+            scene_segments = _scene_segments(total_frames, sample_idxs, diffs)
+            if not scene_segments:
+                scene_segments = [(0, max(0, total_frames - 1))]
+            max_scene_slots = min(
+                len(scene_segments),
+                max_frames,
+                VIDEO_MAX_SCENES,
+                max(1, total_frames),
+            )
+            scene_segments = sorted(
+                scene_segments,
+                key=lambda seg: seg[1] - seg[0],
+                reverse=True,
+            )[:max_scene_slots]
+            scene_segments = sorted(scene_segments, key=lambda seg: seg[0])
+            scene_start = int(min(seg[0] for seg in scene_segments))
+            scene_end = int(max(seg[1] for seg in scene_segments))
+        else:
+            scene_start = 0
+            scene_end = max(0, total_frames - 1)
+            scene_segments = [(scene_start, scene_end)]
 
-    if adaptive_sample and total_frames > 0:
-        idxs = _adaptive_sample_indices(scene_start, scene_end, sample_idxs, diffs, max_frames)
+    if total_frames > 0 and adaptive_sample:
+        budgets = _allocate_segment_budgets(scene_segments, min(max_frames, total_frames))
+        picked = []
+        for (seg_start, seg_end), budget in zip(scene_segments, budgets):
+            seg_idxs = _adaptive_sample_indices(seg_start, seg_end, sample_idxs, diffs, budget)
+            if not seg_idxs:
+                seg_n = min(budget, max(1, seg_end - seg_start + 1))
+                seg_idxs = np.linspace(seg_start, seg_end, num=seg_n, dtype=int).tolist()
+            picked.extend(int(i) for i in seg_idxs)
+        idxs = sorted(set(i for i in picked if scene_start <= i <= scene_end))
+
     if not idxs:
         if total_frames > 0:
-            idxs = np.linspace(scene_start, scene_end, num=min(max_frames, scene_end - scene_start + 1), dtype=int)
+            budgets = _allocate_segment_budgets(scene_segments, min(max_frames, total_frames))
+            picked = []
+            for (seg_start, seg_end), budget in zip(scene_segments, budgets):
+                seg_n = min(budget, max(1, seg_end - seg_start + 1))
+                seg_idxs = np.linspace(seg_start, seg_end, num=seg_n, dtype=int).tolist()
+                picked.extend(int(i) for i in seg_idxs)
+            idxs = sorted(set(i for i in picked if scene_start <= i <= scene_end))
+            if not idxs:
+                idxs = np.linspace(
+                    scene_start,
+                    scene_end,
+                    num=min(max_frames, scene_end - scene_start + 1),
+                    dtype=int,
+                ).tolist()
         else:
             idxs = list(range(max_frames))
+
+    if len(idxs) > max_frames:
+        keep = np.linspace(0, len(idxs) - 1, num=max_frames, dtype=int).tolist()
+        idxs = [idxs[i] for i in keep]
+    if total_frames > 0 and len(idxs) < min(max_frames, total_frames):
+        filler = np.linspace(scene_start, scene_end, num=min(max_frames, total_frames), dtype=int).tolist()
+        idxs_set = set(int(i) for i in idxs)
+        for i in filler:
+            idxs_set.add(int(i))
+            if len(idxs_set) >= min(max_frames, total_frames):
+                break
+        idxs = sorted(idxs_set)
 
     for idx in idxs:
         try:
@@ -794,6 +1199,8 @@ def aggregate_video_probs(
     strictness: str = "balanced",
     min_agree: int = 2,
     weights=None,
+    real_thresh: float = 0.50,
+    fake_thresh: float = 0.50,
 ):
     """
     Returns: (video_prob, video_label, chosen_frame_index, metrics_dict)
@@ -814,13 +1221,14 @@ def aggregate_video_probs(
         except Exception:
             weights_arr = None
 
-    # thresholds by strictness
-    if strictness == "conservative":
-        th_fake, th_real = 0.65, 0.35
-    elif strictness == "aggressive":
-        th_fake, th_real = 0.55, 0.45
-    else:
-        th_fake, th_real = 0.60, 0.40
+    midpoint = float(np.clip((float(real_thresh) + float(fake_thresh)) * 0.5, 0.01, 0.99))
+    strict_margin = {
+        "conservative": 0.08,
+        "balanced": 0.04,
+        "aggressive": 0.00,
+    }.get(str(strictness), 0.04)
+    th_fake = float(np.clip(midpoint + strict_margin, 0.01, 0.99))
+    th_real = float(np.clip(midpoint - strict_margin, 0.01, 0.99))
 
     topk_frac = float(np.clip(topk_frac, 0.05, 1.0))
     k = max(1, int(np.ceil(topk_frac * n)))
@@ -857,29 +1265,43 @@ def aggregate_video_probs(
 
     # count model labels
     counts = {"REAL": 0, "TAMPERED": 0, "FAKE": 0, "INCONCLUSIVE": 0, "UNCERTAIN": 0}
-    for p in frame_preds:
-        if p in counts:
-            counts[p] += 1
+    normalized_preds = []
+    for idx, pred in enumerate(frame_preds):
+        p_frame = float(probs[idx]) if idx < n else 0.5
+        if pred == "REAL":
+            norm = "REAL"
+        elif pred in ("FAKE", "SYNTHETIC", "EDITED"):
+            norm = "FAKE"
+        elif pred in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
+            norm = collapse_binary_label(pred, p_frame)
+            counts["TAMPERED"] += 1
         else:
-            counts["INCONCLUSIVE"] += 1
+            norm = collapse_binary_label(pred, p_frame)
+            if pred in ("INCONCLUSIVE", "UNCERTAIN"):
+                counts["UNCERTAIN"] += 1
+        normalized_preds.append(norm)
+        if norm == "REAL":
+            counts["REAL"] += 1
+        else:
+            counts["FAKE"] += 1
+            if pred in ("INCONCLUSIVE", "UNCERTAIN"):
+                counts["INCONCLUSIVE"] += 1
 
-    # conservative label rules
+    # binary label rules
     if (video_prob >= th_fake and n_fake >= min_agree) or counts["FAKE"] >= min_agree:
         video_label = "FAKE"
-    elif counts["TAMPERED"] >= min_agree and counts["FAKE"] == 0:
-        video_label = "TAMPERED"
     elif (video_prob <= th_real and n_real >= min_agree) and counts["FAKE"] == 0:
         video_label = "REAL"
     else:
-        video_label = "INCONCLUSIVE"
-
-    if DISABLE_TAMPERED and video_label == "TAMPERED":
-        video_label = "FAKE" if video_prob >= th_fake else "REAL"
-    if DISABLE_INCONCLUSIVE and video_label in ("INCONCLUSIVE", "UNCERTAIN"):
-        video_label = "FAKE" if video_prob >= th_fake else "REAL"
+        video_label = "FAKE" if (video_prob >= midpoint and counts["FAKE"] > counts["REAL"]) else "REAL"
 
     image_level_p_fake = float(np.max(probs))
-    if image_level_p_fake > 0.75:
+    high_conf_frame_ratio = float(np.mean(probs >= 0.70))
+    if image_level_p_fake > 0.82 and (
+        n_fake >= min_agree
+        or counts["FAKE"] >= min_agree
+        or high_conf_frame_ratio >= 0.30
+    ):
         video_label = "FAKE"
         video_prob = max(video_prob, image_level_p_fake * 0.9)
 
@@ -887,21 +1309,11 @@ def aggregate_video_probs(
     score_for_pick = probs if weights_arr is None else probs * weights_arr
     if video_label == "FAKE":
         chosen = int(np.argmax(score_for_pick))
-    elif video_label == "REAL":
+    else:
         if weighted_median_idx is not None:
             chosen = int(weighted_median_idx)
         else:
             chosen = int(np.argmin(np.abs(probs - np.median(probs))))
-    elif video_label == "TAMPERED":
-        # prefer a frame that the image model calls TAMPERED
-        idxs = [i for i, lab in enumerate(frame_preds) if lab == "TAMPERED"]
-        if idxs:
-            local_scores = score_for_pick[idxs]
-            chosen = int(idxs[int(np.argmax(local_scores))])
-        else:
-            chosen = int(np.argmin(np.abs(probs - video_prob)))
-    else:
-        chosen = int(np.argmin(np.abs(probs - video_prob)))
 
     metrics = {
         "n": n,
@@ -910,11 +1322,16 @@ def aggregate_video_probs(
         "topk_frac": float(topk_frac),
         "video_prob": float(video_prob),
         "video_std": float(video_std),
+        "mean_frame_prob": float(np.mean(probs)),
+        "max_frame_prob": float(np.max(probs)),
+        "min_frame_prob": float(np.min(probs)),
+        "high_conf_frame_ratio": float(high_conf_frame_ratio),
         "th_fake": float(th_fake),
         "th_real": float(th_real),
         "n_fake_frames": int(n_fake),
         "n_real_frames": int(n_real),
         "label_counts": counts,
+        "normalized_frame_preds": normalized_preds,
     }
     if weights_arr is not None:
         metrics["weights_used"] = True
@@ -1167,10 +1584,10 @@ PATCH_GRID_ROWS = 4
 PATCH_GRID_COLS = 4
 
 # Final decision threshold for p_final (simple rule)
-FINAL_THRESHOLD = float(os.getenv("FINAL_THRESHOLD", "0.52"))
+FINAL_THRESHOLD = APP_CONFIG.final_threshold
 
 # Optional: cosine anomaly uses a real-image mean embedding
-REAL_REF_DIR   = os.getenv("REAL_REF_DIR")  # Optional folder with real photos
+REAL_REF_DIR   = APP_CONFIG.real_ref_dir  # Optional folder with real photos
 MEAN_EMBEDDING = None
 MEAN_EMBED_CACHE = os.path.join(CACHE_DIR, "mean_real_embedding.npy")
 
@@ -1267,29 +1684,41 @@ def _filter_state_for_model(state, model):
 def get_siglip_model():
     """Loads SigLIP + MLP head from HF repo."""
     desired_device = "cuda" if torch.cuda.is_available() else "cpu"
-    if not hasattr(get_siglip_model, "_cache"):
-        best_path = hf_hub_download(
-            repo_id=MODEL_REPO,
-            filename="best_model.safetensors",
-            token=HF_TOKEN,
-            cache_dir=CACHE_DIR,
-        )
+    cached = getattr(get_siglip_model, "_cache", None)
+    if cached is not None:
+        try:
+            current = next(cached.parameters()).device.type
+        except StopIteration:
+            current = desired_device
+        if current == desired_device:
+            return cached
 
-        state = load_file(best_path)
-        model = BinaryClassifier("large", desired_device).to(desired_device).eval()
-        model.load_state_dict(_filter_state_for_model(state, model), strict=False)
-        
-        get_siglip_model._cache = model
-        print(f"[init] SigLIP loaded on {desired_device} from {best_path}")
-    else:
-        # Move cached model if device availability changed
-        m = get_siglip_model._cache
-        current = next(m.parameters()).device.type
+    with _SIGLIP_MODEL_LOCK:
+        cached = getattr(get_siglip_model, "_cache", None)
+        if cached is None:
+            best_path = hf_hub_download(
+                repo_id=MODEL_REPO,
+                filename="best_model.safetensors",
+                token=HF_TOKEN,
+                cache_dir=CACHE_DIR,
+            )
+
+            state = load_file(best_path)
+            model = BinaryClassifier("large", desired_device).to(desired_device).eval()
+            model.load_state_dict(_filter_state_for_model(state, model), strict=False)
+            get_siglip_model._cache = model
+            print(f"[init] SigLIP loaded on {desired_device} from {best_path}")
+            return model
+
+        try:
+            current = next(cached.parameters()).device.type
+        except StopIteration:
+            current = desired_device
         if current != desired_device:
-            m = m.to(desired_device).eval()
-            get_siglip_model._cache = m
+            cached = cached.to(desired_device).eval()
+            get_siglip_model._cache = cached
             print(f"[init] SigLIP moved to {desired_device}")
-    return get_siglip_model._cache
+        return get_siglip_model._cache
 
 
 def _list_images_recursive(root):
@@ -1422,6 +1851,7 @@ def load_siglip_models():
 
 _XGB_MODEL = None
 _PLATT = None
+_XGB_LOAD_TRIED = False
 
 
 def load_xgb_fusion():
@@ -1430,51 +1860,56 @@ def load_xgb_fusion():
     Requires xgb_fusion.json and platt.json to be present in MODEL_REPO.
     Returns (model, platt_dict) or (None, None) on failure.
     """
-    global _XGB_MODEL, _PLATT
+    global _XGB_MODEL, _PLATT, _XGB_LOAD_TRIED
 
     if xgb is None:
         print("[xgb] xgboost not installed; XGB fusion disabled.")
         return None, None
 
-    if _XGB_MODEL is not None and _PLATT is not None:
+    if _XGB_LOAD_TRIED:
         return _XGB_MODEL, _PLATT
 
-    try:
-        xgb_path = hf_hub_download(
-            repo_id=MODEL_REPO,
-            filename="xgb_fusion.json",
-            cache_dir=CACHE_DIR,
-            token=HF_TOKEN,
-        )
-        platt_path = hf_hub_download(
-            repo_id=MODEL_REPO,
-            filename="platt.json",
-            cache_dir=CACHE_DIR,
-            token=HF_TOKEN,
-        )
-    except Exception as e:
-        print(f"[xgb] Could not download fusion files from HF: {e}")
-        return None, None
+    with _XGB_MODEL_LOCK:
+        if _XGB_LOAD_TRIED:
+            return _XGB_MODEL, _PLATT
+        
+        _XGB_LOAD_TRIED = True
+        try:
+            xgb_path = hf_hub_download(
+                repo_id=MODEL_REPO,
+                filename="xgb_fusion.json",
+                cache_dir=CACHE_DIR,
+                token=HF_TOKEN,
+            )
+            platt_path = hf_hub_download(
+                repo_id=MODEL_REPO,
+                filename="platt.json",
+                cache_dir=CACHE_DIR,
+                token=HF_TOKEN,
+            )
+        except Exception as e:
+            print(f"[xgb] Fusion files not found or download failed (this is usually fine): {e.__class__.__name__}")
+            return None, None
 
-    try:
-        model = xgb.Booster()
-        model.load_model(xgb_path)
-    except Exception as e:
-        print(f"[xgb] Failed to load XGBoost model: {e}")
-        return None, None
+        try:
+            model = xgb.Booster()
+            model.load_model(xgb_path)
+        except Exception as e:
+            print(f"[xgb] Failed to load XGBoost model: {e}")
+            return None, None
 
-    try:
-        with open(platt_path, "r") as f:
-            platt = _json.load(f)
-    except Exception as e:
-        print(f"[xgb] Failed to load Platt scaler: {e}")
-        return None, None
+        try:
+            with open(platt_path, "r") as f:
+                platt = _json.load(f)
+        except Exception as e:
+            print(f"[xgb] Failed to load Platt scaler: {e}")
+            return None, None
 
-    _XGB_MODEL = model
-    _PLATT = platt
-    print(f"[xgb] Loaded fusion model from: {xgb_path}")
-    print(f"[xgb] Loaded Platt scaler from: {platt_path}")
-    return _XGB_MODEL, _PLATT
+        _XGB_MODEL = model
+        _PLATT = platt
+        print(f"[xgb] Loaded fusion model from: {xgb_path}")
+        print(f"[xgb] Loaded Platt scaler from: {platt_path}")
+        return _XGB_MODEL, _PLATT
 
 # ============================================================
 #                  FREQUENCY MLP (24-D)
@@ -1513,7 +1948,15 @@ class FreqMLP(nn.Module):
 @torch.no_grad()
 def get_freq_mlp():
     """Load frequency MLP from HF repo."""
-    if not hasattr(get_freq_mlp, "_cache"):
+    cached = getattr(get_freq_mlp, "_cache", None)
+    if cached is not None:
+        return cached
+
+    with _FREQ_MLP_LOCK:
+        cached = getattr(get_freq_mlp, "_cache", None)
+        if cached is not None:
+            return cached
+
         freq_path = hf_hub_download(
             repo_id=MODEL_REPO,
             filename="freq_mlp.safetensors",
@@ -1525,8 +1968,7 @@ def get_freq_mlp():
         model.eval()
         get_freq_mlp._cache = model
         print(f"[init] FreqMLP loaded on {FREQ_DEVICE} from {freq_path}")
-
-    return get_freq_mlp._cache
+        return model
 
 # ============================================================
 #                     V5 ADAPTIVE FUSION HEAD (OPTIONAL)
@@ -1567,28 +2009,35 @@ def get_fusion_head():
     """Load simple 2-input fusion head (required)."""
     if not DETECT_USE_FUSION:
         raise SystemExit("Fusion head required but DETECT_USE_FUSION=0")
-    if hasattr(get_fusion_head, "_cache"):
-        return get_fusion_head._cache
+    cached = getattr(get_fusion_head, "_cache", None)
+    if cached is not None:
+        return cached
 
-    class FusionHead(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc = nn.Linear(2, 1)
-        def forward(self, x):
-            return self.fc(x)
+    with _FUSION_HEAD_LOCK:
+        cached = getattr(get_fusion_head, "_cache", None)
+        if cached is not None:
+            return cached
 
-    path = hf_hub_download(
-        repo_id=MODEL_REPO,
-        filename="fusion_head.safetensors",
-        token=HF_TOKEN,
-        cache_dir=CACHE_DIR,
-    )
-    state = load_file(path)
-    head = FusionHead().to(DEVICE).eval()
-    head.load_state_dict(state, strict=True)
-    get_fusion_head._cache = head
-    print(f"[fusion] Loaded fusion_head.safetensors on {DEVICE} from {path} (2->1 linear)")
-    return head
+        class FusionHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(2, 1)
+
+            def forward(self, x):
+                return self.fc(x)
+
+        path = hf_hub_download(
+            repo_id=MODEL_REPO,
+            filename="fusion_head.safetensors",
+            token=HF_TOKEN,
+            cache_dir=CACHE_DIR,
+        )
+        state = load_file(path)
+        head = FusionHead().to(DEVICE).eval()
+        head.load_state_dict(state, strict=True)
+        get_fusion_head._cache = head
+        print(f"[fusion] Loaded fusion_head.safetensors on {DEVICE} from {path} (2->1 linear)")
+        return head
 
 # ============================================================
 #              FFT + SRM FORENSIC FEATURES (24-D)
@@ -1812,13 +2261,16 @@ def prnu_temporal_incoherence(frames):
     Real sensors: PRNU correlates across frames
     Sora: noise injected per-frame
     """
-    if frames is None or len(frames) < 3:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["rgb"]) < 3:
+        return None
 
     prnus = []
-    for f in frames:
-        img = np.asarray(f)
-        prnus.append(extract_prnu(img))
+    for img in ctx["rgb"]:
+        try:
+            prnus.append(extract_prnu(img))
+        except Exception:
+            continue
 
     corrs = []
     for i in range(len(prnus) - 1):
@@ -1828,10 +2280,9 @@ def prnu_temporal_incoherence(frames):
         if np.isfinite(corr):
             corrs.append(corr)
 
-    if not corrs:
-        return 0.0
-
-    mean_corr = float(np.mean(corrs))
+    mean_corr = _robust_mean(corrs)
+    if mean_corr is None:
+        return None
 
     # Real cameras ~ 0.4-0.7, Sora ~ 0.0-0.2
     return float(np.clip((0.35 - mean_corr) / 0.35, 0.0, 1.0))
@@ -1842,15 +2293,14 @@ def prnu_temporal_incoherence_flat(frames):
     PRNU correlation in low-texture regions after denoising.
     Helps when global PRNU is masked by noise.
     """
-    if frames is None or len(frames) < 3:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["rgb"]) < 3:
+        return None
 
     prnus = []
     masks = []
-    for f in frames:
+    for img, gray in zip(ctx["rgb"], ctx["gray"]):
         try:
-            img = np.asarray(f)
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             try:
                 den = cv2.fastNlMeansDenoising(gray, None, h=5, templateWindowSize=7, searchWindowSize=21)
                 den_f = den.astype(np.float32) / 255.0
@@ -1871,7 +2321,7 @@ def prnu_temporal_incoherence_flat(frames):
             continue
 
     if len(prnus) < 2:
-        return 0.0
+        return None
 
     corrs = []
     for i in range(len(prnus) - 1):
@@ -1888,10 +2338,9 @@ def prnu_temporal_incoherence_flat(frames):
         if np.isfinite(corr):
             corrs.append(corr)
 
-    if not corrs:
-        return 0.0
-
-    mean_corr = float(np.mean(corrs))
+    mean_corr = _robust_mean(corrs)
+    if mean_corr is None:
+        return None
     return float(np.clip((0.30 - mean_corr) / 0.30, 0.0, 1.0))
 
 
@@ -1922,13 +2371,13 @@ def jpeg_block_drift(frames):
     Measures drift in JPEG block grid statistics across frames.
     Lower correlation -> more suspicious compression inconsistency.
     """
-    if frames is None or len(frames) < 3:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 3:
+        return None
 
     maps = []
-    for f in frames:
+    for gray in ctx["gray"]:
         try:
-            gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY)
             gray = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
             h, w = gray.shape
             h8 = h - (h % 8)
@@ -1946,7 +2395,7 @@ def jpeg_block_drift(frames):
             continue
 
     if len(maps) < 2:
-        return 0.0
+        return None
 
     corrs = []
     for i in range(len(maps) - 1):
@@ -1956,10 +2405,9 @@ def jpeg_block_drift(frames):
         if np.isfinite(corr):
             corrs.append(corr)
 
-    if not corrs:
-        return 0.0
-
-    mean_corr = float(np.mean(corrs))
+    mean_corr = _robust_mean(corrs)
+    if mean_corr is None:
+        return None
     return float(np.clip((0.40 - mean_corr) / 0.40, 0.0, 1.0))
 
 
@@ -2653,27 +3101,33 @@ def parallax_inconsistency(frames):
     Checks depth-motion agreement.
     Sora struggles with parallax under camera motion.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray192"]) < 2:
+        return None
 
     errs = []
-    for i in range(1, len(frames)):
-        a = cv2.cvtColor(np.asarray(frames[i - 1]), cv2.COLOR_RGB2GRAY)
-        b = cv2.cvtColor(np.asarray(frames[i]), cv2.COLOR_RGB2GRAY)
+    gray_seq = ctx["gray192"]
+    for i in range(1, len(gray_seq)):
+        try:
+            prev = gray_seq[i - 1]
+            curr = gray_seq[i]
+            M = _estimate_global_affine(prev, curr)
+            prev_stab = _warp_gray_affine(prev, M)
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_stab, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0
+            )
+            mag = np.linalg.norm(flow, axis=2)
+            edges = cv2.Canny(curr, 100, 200)
+            if edges.sum() > 0:
+                errs.append(float(np.var(mag[edges > 0])))
+            else:
+                errs.append(float(np.var(mag)))
+        except Exception:
+            continue
 
-        flow = cv2.calcOpticalFlowFarneback(
-            a, b, None, 0.5, 3, 15, 3, 5, 1.2, 0
-        )
-        mag = np.linalg.norm(flow, axis=2)
-
-        edges = cv2.Canny(b, 100, 200)
-        if edges.sum() > 0:
-            errs.append(float(np.var(mag[edges > 0])))
-
-    if not errs:
-        return 0.0
-
-    v = float(np.mean(errs))
+    v = _robust_mean(errs)
+    if v is None:
+        return None
     return float(np.clip(v / 15.0, 0.0, 1.0))
 
 
@@ -2883,52 +3337,92 @@ def vov_score(img_np, patch_size=32):
     return float(np.clip(score, 0, 1))
 
 
-def self_similarity_anomaly_score(img_np, patch=16, stride=8, max_patches=200):
-    small = cv2.resize(img_np, (256, 256), interpolation=cv2.INTER_AREA)
-    H, W, _ = small.shape
-    patches = []
-    coords = []
-
-    for y in range(0, H - patch + 1, stride):
-        for x in range(0, W - patch + 1, stride):
-            p = small[y:y+patch, x:x+patch].astype(np.float32) / 255.0
-            patches.append(p.reshape(-1))
-            coords.append((y, x))
-
-    patches = np.stack(patches, axis=0)
-    coords = np.array(coords)
-    N = patches.shape[0]
-
-    if N > max_patches:
-        idx = np.random.choice(N, max_patches, replace=False)
-        patches = patches[idx]
-        coords = coords[idx]
-        N = max_patches
-
-    norms = np.linalg.norm(patches, axis=1, keepdims=True) + 1e-9
-    patches_n = patches / norms
-
-    sims = []
-    for i in range(N):
-        for j in range(i+1, N):
-            if abs(coords[i,0] - coords[j,0]) < patch*2 and abs(coords[i,1] - coords[j,1]) < patch*2:
-                continue
-            s = float(np.dot(patches_n[i], patches_n[j]))
-            sims.append(s)
-
-    if not sims:
+def vectorized_patch_correlation(image_tensor: torch.Tensor, patch_size=16, stride=8, max_patches=200):
+    """
+    Compute a global patch correlation score with tensor unfolding instead of nested loops.
+    """
+    if image_tensor.ndim == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    if image_tensor.ndim != 4:
         return 0.0
 
-    sims = np.array(sims)
-    high = np.mean(sims > 0.90)
-    return float(np.clip(high, 0, 1))
+    patches = torch.nn.functional.unfold(
+        image_tensor,
+        kernel_size=patch_size,
+        stride=stride,
+    )
+    if patches.numel() == 0:
+        return 0.0
+
+    patches = patches.squeeze(0).t()
+    n_patches = patches.shape[0]
+    if n_patches < 2:
+        return 0.0
+
+    if n_patches > max_patches:
+        keep = torch.linspace(
+            0,
+            n_patches - 1,
+            steps=max_patches,
+            device=patches.device,
+        ).round().long()
+        patches = patches.index_select(0, keep)
+
+    patches = torch.nn.functional.normalize(patches, p=2, dim=1)
+    sim_matrix = torch.mm(patches, patches.t())
+    sim_matrix.fill_diagonal_(0)
+    return float(torch.clamp(sim_matrix.max(), 0.0, 1.0).item())
+
+
+def vectorized_texture_analysis(image_tensor: torch.Tensor, patch_size=32, stride=16):
+    """Estimate patch-level texture consistency using tensor unfolding."""
+    if image_tensor.ndim == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    if image_tensor.ndim != 4:
+        return 0.0
+
+    patches = image_tensor.unfold(2, patch_size, stride).unfold(3, patch_size, stride)
+    if patches.numel() == 0:
+        return 0.0
+    patches = patches.contiguous().view(-1, image_tensor.shape[1], patch_size, patch_size)
+    patch_std = torch.std(patches, dim=(2, 3))
+    return float(torch.var(patch_std).item())
+
+
+def self_similarity_anomaly_score(img_np, patch=16, stride=8, max_patches=200):
+    small = cv2.resize(img_np, (256, 256), interpolation=cv2.INTER_AREA)
+    tensor = (
+        torch.from_numpy(small)
+        .permute(2, 0, 1)
+        .contiguous()
+        .float()
+        .div(255.0)
+        .to(DEVICE)
+    )
+    score = vectorized_patch_correlation(
+        tensor,
+        patch_size=patch,
+        stride=stride,
+        max_patches=max_patches,
+    )
+    return float(np.clip(score, 0, 1))
 
 
 def diffusion_score(img_np):
     s1 = perlin_residual_score(img_np)
     s2 = vov_score(img_np)
     s3 = self_similarity_anomaly_score(img_np)
-    return float(np.clip(0.4*s1 + 0.3*s2 + 0.3*s3, 0, 1))
+    texture_tensor = (
+        torch.from_numpy(cv2.resize(img_np, (256, 256), interpolation=cv2.INTER_AREA))
+        .permute(2, 0, 1)
+        .contiguous()
+        .float()
+        .div(255.0)
+        .to(DEVICE)
+    )
+    texture_raw = vectorized_texture_analysis(texture_tensor, patch_size=32, stride=16)
+    texture_score = float(np.clip(texture_raw / 0.02, 0.0, 1.0))
+    return float(np.clip(0.35*s1 + 0.25*s2 + 0.25*s3 + 0.15*texture_score, 0, 1))
 
 
 def forensic_v2(img_np):
@@ -3211,7 +3705,7 @@ def stabilized_fusion(raw, coral, v, f, max_patch, patch_mean):
 #            CORE SIGNAL FUSION (SigLIP + Freq + CORAL)
 # ============================================================
 
-def detect_core(pil, siglip, freq_mlp, multicrop=True):
+def detect_core(pil, siglip, freq_mlp, multicrop=True, rotate_check=True):
     """
     Run SigLIP + frequency MLP + CORAL on a single PIL image,
     and return a dict of logits/probs/fusion signals.
@@ -3221,32 +3715,39 @@ def detect_core(pil, siglip, freq_mlp, multicrop=True):
     if multicrop:
         crops, weights = make_multicrops(pil)
         x_batch = torch.stack([preprocess(c) for c in crops], dim=0).to(DEVICE)
-        z_sigs = siglip(x_batch).detach().cpu()
+        with torch.autocast(device_type="cuda" if DEVICE == "cuda" else "cpu", enabled=torch.cuda.is_available()):
+            z_sigs = siglip(x_batch).detach().cpu()
 
         f_batch = torch.stack(
             [extract_freq_vector(c) for c in crops], dim=0
         ).to(FREQ_DEVICE)
-        z_freqs = freq_mlp(f_batch).detach().cpu()
+        with torch.autocast(device_type="cuda" if FREQ_DEVICE == "cuda" else "cpu", enabled=torch.cuda.is_available()):
+            z_freqs = freq_mlp(f_batch).detach().cpu()
 
         z_sig  = float((z_sigs * weights).sum().item())
         z_freq = float((z_freqs * weights).sum().item())
     else:
         x = preprocess(pil).unsqueeze(0).to(DEVICE)
-        z_sig = float(siglip(x).item())
+        with torch.autocast(device_type="cuda" if DEVICE == "cuda" else "cpu", enabled=torch.cuda.is_available()):
+            z_sig = float(siglip(x).item())
         fvec = extract_freq_vector(pil).unsqueeze(0).to(FREQ_DEVICE)
-        z_freq = float(freq_mlp(fvec).item())
+        with torch.autocast(device_type="cuda" if FREQ_DEVICE == "cuda" else "cpu", enabled=torch.cuda.is_available()):
+            z_freq = float(freq_mlp(fvec).item())
 
     # Second SigLIP head: 90° rotated view (dual-view stabilizer)
-    try:
-        pil_rot = pil.rotate(90, expand=False)
-        x_rot = preprocess(pil_rot).unsqueeze(0).to(DEVICE)
-        z_rot = float(siglip(x_rot).item())
-        base_prob = float(torch.sigmoid(torch.tensor(z_sig)).item())
-        rot_prob = float(torch.sigmoid(torch.tensor(z_rot)).item())
-        visual_prob = 0.6 * base_prob + 0.4 * rot_prob
-        z_sig = float(_logit(visual_prob))
-    except Exception:
-        visual_prob = float(torch.sigmoid(torch.tensor(z_sig)).item())
+    visual_prob = float(torch.sigmoid(torch.tensor(z_sig)).item())
+    if rotate_check:
+        try:
+            pil_rot = pil.rotate(90, expand=False)
+            x_rot = preprocess(pil_rot).unsqueeze(0).to(DEVICE)
+            with torch.autocast(device_type="cuda" if DEVICE == "cuda" else "cpu", enabled=torch.cuda.is_available()):
+                z_rot = float(siglip(x_rot).item())
+            base_prob = visual_prob
+            rot_prob = float(torch.sigmoid(torch.tensor(z_rot)).item())
+            visual_prob = 0.6 * base_prob + 0.4 * rot_prob
+            z_sig = float(_logit(visual_prob))
+        except Exception:
+            pass
 
     # Head-wise probabilities for diagnostics
     p_sig = visual_prob
@@ -3396,7 +3897,7 @@ def compute_patch_grid(pil, siglip, freq_mlp, rows=PATCH_GRID_ROWS, cols=PATCH_G
                 s=0.0
             else:
                 patch = pil.crop((x0,y0,x1,y1))
-                res = detect_core(patch, siglip, freq_mlp, multicrop=False)
+                res = detect_core(patch, siglip, freq_mlp, multicrop=False, rotate_check=False)
                 # Use CORAL-free fused probability for heatmap
                 s = float(res["p_fake_raw"])
             grid[r,c] = s
@@ -3519,6 +4020,143 @@ def embedding_anomaly_score(pil, siglip):
 #   TEMPORAL IDENTITY DRIFT (SORA DETECTOR CORE)
 # ============================================================
 
+def _maybe_clear_cuda_cache(step_idx=None):
+    if not torch.cuda.is_available() or step_idx is None:
+        return
+    try:
+        if (int(step_idx) + 1) % 5 == 0:
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+class SoraForensics:
+    """Advanced temporal forensics for Sora-class diffusion video."""
+
+    @staticmethod
+    def compute_flow_divergence(frames) -> float:
+        """Measures forward-backward flow divergence after coarse camera stabilization."""
+        ctx = _get_video_context(frames)
+        if ctx is not None and len(ctx["gray192"]) >= 2:
+            gray_frames = [frame.astype(np.uint8) for frame in ctx["gray192"]]
+        else:
+            gray_frames = []
+            for frame in frames or []:
+                try:
+                    arr = np.asarray(frame)
+                    if arr.ndim == 3:
+                        arr = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+                    gray_frames.append(arr.astype(np.uint8))
+                except Exception:
+                    continue
+
+        if len(gray_frames) < 2:
+            return 0.0
+
+        divergences = []
+        for i in range(len(gray_frames) - 1):
+            try:
+                prev_u8 = gray_frames[i]
+                curr_u8 = gray_frames[i + 1]
+                M = _estimate_global_affine(prev_u8, curr_u8)
+                prev_stab_u8 = _warp_gray_affine(prev_u8, M)
+                prev = prev_stab_u8.astype(np.float32) / 255.0
+                curr = curr_u8.astype(np.float32) / 255.0
+                flow_f = cv2.calcOpticalFlowFarneback(
+                    prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0
+                )
+                flow_b = cv2.calcOpticalFlowFarneback(
+                    curr, prev, None, 0.5, 3, 15, 3, 5, 1.2, 0
+                )
+                h, w = prev.shape
+                grid_x, grid_y = np.meshgrid(
+                    np.arange(w, dtype=np.float32),
+                    np.arange(h, dtype=np.float32),
+                )
+                map_x = np.clip(grid_x + flow_f[..., 0], 0, w - 1).astype(np.float32)
+                map_y = np.clip(grid_y + flow_f[..., 1], 0, h - 1).astype(np.float32)
+                flow_b_warped = cv2.remap(
+                    flow_b,
+                    map_x,
+                    map_y,
+                    interpolation=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT101,
+                )
+                err = np.linalg.norm(flow_f + flow_b_warped, axis=2)
+                motion_mag = np.linalg.norm(flow_f, axis=2)
+                moving = motion_mag > 0.35
+                divergences.append(float(np.mean(err[moving])) if np.any(moving) else float(np.mean(err)))
+            except Exception:
+                continue
+
+        if not divergences:
+            return 0.0
+        return float(np.mean(divergences))
+
+    @staticmethod
+    def geometric_depth_variance(pil_frames) -> float:
+        """Proxy for rubbery geometry using Laplacian depth/structure variance over time."""
+        if pil_frames is None or len(pil_frames) < 2:
+            return 0.0
+        variances = []
+        for frame in pil_frames:
+            try:
+                gray = np.array(frame.convert("L"))
+                variances.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+            except Exception:
+                continue
+        if len(variances) < 2:
+            return 0.0
+        mean_var = float(np.mean(variances))
+        if mean_var <= 1e-6:
+            return 0.0
+        return float(np.std(variances) / (mean_var + 1e-6))
+
+    @staticmethod
+    def check_identity_drift(embeddings: torch.Tensor) -> float:
+        """Tracks variance and downward drift in consecutive frame identity similarity."""
+        if embeddings is None:
+            return 0.0
+        if isinstance(embeddings, list):
+            tensors = []
+            for emb in embeddings:
+                if emb is None:
+                    continue
+                if isinstance(emb, torch.Tensor):
+                    tensors.append(emb.detach().float().view(-1))
+                else:
+                    tensors.append(torch.as_tensor(emb, dtype=torch.float32).view(-1))
+            if len(tensors) < 2:
+                return 0.0
+            embeddings = torch.stack(tensors, dim=0)
+        elif not isinstance(embeddings, torch.Tensor):
+            embeddings = torch.as_tensor(embeddings, dtype=torch.float32)
+
+        if embeddings.ndim == 1:
+            embeddings = embeddings.unsqueeze(0)
+        if embeddings.shape[0] < 2:
+            return 0.0
+
+        norm_emb = torch.nn.functional.normalize(embeddings.float(), p=2, dim=1)
+        sim_matrix = torch.mm(norm_emb, norm_emb.t())
+        consecutive_sims = torch.diag(sim_matrix, diagonal=1)
+        if consecutive_sims.numel() == 0:
+            return 0.0
+
+        sim_std = float(torch.std(consecutive_sims, unbiased=False).item())
+        sim_drop = float(torch.relu(consecutive_sims[0] - consecutive_sims[-1]).item()) if consecutive_sims.numel() > 1 else 0.0
+        mean_shift = max(0.0, 1.0 - float(torch.mean(consecutive_sims).item()))
+        drift_score = (
+            0.45 * min(1.0, sim_std / 0.05) +
+            0.30 * min(1.0, sim_drop / 0.08) +
+            0.25 * min(1.0, mean_shift / 0.18)
+        )
+        return float(np.clip(drift_score, 0.0, 1.0))
+
+
+SoraEngine = SoraForensics
+
+
 @torch.no_grad()
 def temporal_identity_drift(frames, siglip):
     """
@@ -3527,28 +4165,23 @@ def temporal_identity_drift(frames, siglip):
     Sora -> subtle non-rigid drift
     """
     if frames is None or len(frames) < 3:
-        return 0.0
+        return None
 
     embeds = []
-    for f in frames:
-        x = preprocess(f).unsqueeze(0).to(DEVICE)
-        e = siglip.backbone.encode_image(x)
-        e = e / (e.norm(dim=-1, keepdim=True) + 1e-6)
-        embeds.append(e.cpu().numpy()[0])
+    for idx, f in enumerate(frames):
+        try:
+            x = preprocess(f).unsqueeze(0).to(DEVICE)
+            e = siglip.backbone.encode_image(x)
+            e = e / (e.norm(dim=-1, keepdim=True) + 1e-6)
+            embeds.append(e.squeeze(0).detach().cpu())
+            _maybe_clear_cuda_cache(idx)
+        except Exception:
+            continue
 
-    embeds = np.stack(embeds, axis=0)
+    if len(embeds) < 3:
+        return None
 
-    # Pairwise cosine distance
-    sims = []
-    for i in range(len(embeds) - 1):
-        cos = float(np.dot(embeds[i], embeds[i + 1]))
-        sims.append(cos)
-
-    sims = np.array(sims)
-    drift = 1.0 - float(np.mean(sims))
-
-    # Normalize: real ~ 0.05-0.10, Sora ~ 0.25-0.45
-    return float(np.clip((drift - 0.08) / 0.35, 0.0, 1.0))
+    return float(SoraForensics.check_identity_drift(torch.stack(embeds, dim=0)))
 
 # ============================================================
 #   TEMPORAL CONSISTENCY SIGNALS (SORA ATTRIBUTION)
@@ -3601,7 +4234,9 @@ def face_topology_drift(frames):
         float(np.linalg.norm(vectors[i] - vectors[i + 1]))
         for i in range(len(vectors) - 1)
     ]
-    drift = float(np.mean(diffs))
+    drift = _robust_mean(diffs)
+    if drift is None:
+        return None
     return float(np.clip((drift - 0.03) / 0.12, 0.0, 1.0))
 
 
@@ -3639,7 +4274,10 @@ def face_embedding_drift(frames):
     sims = []
     for i in range(len(embeds) - 1):
         sims.append(float(np.dot(embeds[i], embeds[i + 1])))
-    drift = 1.0 - float(np.mean(sims))
+    mean_sim = _robust_mean(sims)
+    if mean_sim is None:
+        return None
+    drift = 1.0 - float(mean_sim)
     return float(np.clip((drift - 0.04) / 0.20, 0.0, 1.0))
 
 
@@ -3738,15 +4376,18 @@ def face_track_consistency(frames):
     scores = []
     if len(track_embeds) >= 3:
         sims = [float(np.dot(track_embeds[i], track_embeds[i + 1])) for i in range(len(track_embeds) - 1)]
-        drift = 1.0 - float(np.mean(sims))
-        embed_score = float(np.clip((drift - 0.04) / 0.20, 0.0, 1.0))
-        scores.append((embed_score, 0.6))
+        mean_sim = _robust_mean(sims)
+        if mean_sim is not None:
+            drift = 1.0 - float(mean_sim)
+            embed_score = float(np.clip((drift - 0.04) / 0.20, 0.0, 1.0))
+            scores.append((embed_score, 0.6))
 
     if len(track_kps) >= 3:
         diffs = [float(np.linalg.norm(track_kps[i] - track_kps[i + 1])) for i in range(len(track_kps) - 1)]
-        drift = float(np.mean(diffs))
-        geom_score = float(np.clip((drift - 0.03) / 0.12, 0.0, 1.0))
-        scores.append((geom_score, 0.4))
+        drift = _robust_mean(diffs)
+        if drift is not None:
+            geom_score = float(np.clip((drift - 0.03) / 0.12, 0.0, 1.0))
+            scores.append((geom_score, 0.4))
 
     if not scores:
         return None
@@ -3760,7 +4401,8 @@ def object_identity_inconsistency(frames):
     Uses ORB feature persistence as a proxy for object identity stability.
     Higher = more inconsistent across frames.
     """
-    if frames is None or len(frames) < 3:
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 3:
         return None
 
     try:
@@ -3770,10 +4412,11 @@ def object_identity_inconsistency(frames):
         return None
 
     ratios = []
-    for i in range(1, len(frames)):
+    gray_seq = ctx["gray"]
+    for i in range(1, len(gray_seq)):
         try:
-            a = cv2.cvtColor(np.asarray(frames[i - 1]), cv2.COLOR_RGB2GRAY)
-            b = cv2.cvtColor(np.asarray(frames[i]), cv2.COLOR_RGB2GRAY)
+            a = gray_seq[i - 1]
+            b = gray_seq[i]
             kpa, desa = orb.detectAndCompute(a, None)
             kpb, desb = orb.detectAndCompute(b, None)
             if desa is None or desb is None or not kpa or not kpb:
@@ -3791,7 +4434,9 @@ def object_identity_inconsistency(frames):
     if not ratios:
         return None
 
-    mean_ratio = float(np.mean(ratios))
+    mean_ratio = _robust_mean(ratios)
+    if mean_ratio is None:
+        return None
     return float(np.clip((0.25 - mean_ratio) / 0.25, 0.0, 1.0))
 
 
@@ -3800,13 +4445,13 @@ def background_temporal_inconsistency(frames):
     Measures background histogram instability on border regions.
     Higher = more inconsistent across frames.
     """
-    if frames is None or len(frames) < 2:
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 2:
         return None
 
     hists = []
-    for f in frames:
+    for gray in ctx["gray"]:
         try:
-            gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY)
             h, w = gray.shape
             b = int(min(h, w) * 0.12)
             if b < 4:
@@ -3829,7 +4474,9 @@ def background_temporal_inconsistency(frames):
         cv2.compareHist(hists[i], hists[i + 1], cv2.HISTCMP_BHATTACHARYYA)
         for i in range(len(hists) - 1)
     ]
-    mean_diff = float(np.mean(diffs))
+    mean_diff = _robust_mean(diffs)
+    if mean_diff is None:
+        return None
     return float(np.clip(mean_diff / 0.35, 0.0, 1.0))
 
 
@@ -3837,25 +4484,28 @@ def temporal_texture_flicker(frames):
     """
     Measures flicker in high-frequency energy across frames.
     """
-    if frames is None or len(frames) < 3:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 3:
+        return None
 
     vals = []
-    for f in frames:
+    for gray in ctx["gray"]:
         try:
-            gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY)
             vals.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
         except Exception:
             continue
 
     if len(vals) < 3:
-        return 0.0
+        return None
 
-    mean_val = float(np.mean(vals))
+    mean_val = _robust_mean(vals)
+    if mean_val is None:
+        return None
     if mean_val <= 0.0:
-        return 0.0
+        return None
 
-    cv = float(np.std(vals) / mean_val)
+    vals_arr = np.asarray(vals, dtype=np.float32)
+    cv = float(np.std(vals_arr) / mean_val)
     return float(np.clip((cv - 0.15) / 0.60, 0.0, 1.0))
 
 
@@ -3864,14 +4514,20 @@ def flow_reprojection_error(frames):
     Measures photometric error after optical flow reprojection.
     Higher = less motion-consistent.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray192"]) < 2:
+        return None
 
     errs = []
-    for i in range(1, len(frames)):
+    gray_seq = ctx["gray192"]
+    for i in range(1, len(gray_seq)):
         try:
-            prev = cv2.cvtColor(np.asarray(frames[i - 1]), cv2.COLOR_RGB2GRAY).astype(np.float32)
-            curr = cv2.cvtColor(np.asarray(frames[i]), cv2.COLOR_RGB2GRAY).astype(np.float32)
+            prev_u8 = gray_seq[i - 1]
+            curr_u8 = gray_seq[i]
+            M = _estimate_global_affine(prev_u8, curr_u8)
+            prev_stab_u8 = _warp_gray_affine(prev_u8, M)
+            prev = prev_stab_u8.astype(np.float32)
+            curr = curr_u8.astype(np.float32)
             flow = cv2.calcOpticalFlowFarneback(
                 prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0
             )
@@ -3891,10 +4547,9 @@ def flow_reprojection_error(frames):
         except Exception:
             continue
 
-    if not errs:
-        return 0.0
-
-    mean_err = float(np.mean(errs))
+    mean_err = _robust_mean(errs)
+    if mean_err is None:
+        return None
     return float(np.clip((mean_err - 0.03) / 0.12, 0.0, 1.0))
 
 
@@ -3902,26 +4557,29 @@ def temporal_edge_flicker(frames):
     """
     Measures instability in edge density across frames.
     """
-    if frames is None or len(frames) < 3:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 3:
+        return None
 
     densities = []
-    for f in frames:
+    for gray in ctx["gray"]:
         try:
-            gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY)
             edges = cv2.Canny(gray, 80, 160)
             densities.append(float(np.mean(edges > 0)))
         except Exception:
             continue
 
     if len(densities) < 3:
-        return 0.0
+        return None
 
-    mean_val = float(np.mean(densities))
+    mean_val = _robust_mean(densities)
+    if mean_val is None:
+        return None
     if mean_val <= 0.0:
-        return 0.0
+        return None
 
-    cv = float(np.std(densities) / mean_val)
+    density_arr = np.asarray(densities, dtype=np.float32)
+    cv = float(np.std(density_arr) / mean_val)
     return float(np.clip((cv - 0.15) / 0.50, 0.0, 1.0))
 
 
@@ -3929,25 +4587,28 @@ def temporal_color_drift(frames):
     """
     Measures average color drift across frames.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["rgb"]) < 2:
+        return None
 
     means = []
-    for f in frames:
+    for rgb in ctx["rgb"]:
         try:
-            lab = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2LAB)
+            lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
             means.append(lab.reshape(-1, 3).mean(axis=0))
         except Exception:
             continue
 
     if len(means) < 2:
-        return 0.0
+        return None
 
     diffs = [
         float(np.linalg.norm(means[i] - means[i + 1]))
         for i in range(len(means) - 1)
     ]
-    mean_diff = float(np.mean(diffs))
+    mean_diff = _robust_mean(diffs)
+    if mean_diff is None:
+        return None
     return float(np.clip((mean_diff - 4.0) / 16.0, 0.0, 1.0))
 
 
@@ -3956,14 +4617,15 @@ def noise_residual_incoherence(frames):
     Measures correlation of noise residuals in low-texture regions.
     Lower correlation -> more suspicious.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 2:
+        return None
 
     residuals = []
     masks = []
-    for f in frames:
+    for gray_u8 in ctx["gray"]:
         try:
-            gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY).astype(np.float32)
+            gray = gray_u8.astype(np.float32)
             blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
             resid = gray - blur
             gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
@@ -3978,7 +4640,7 @@ def noise_residual_incoherence(frames):
             continue
 
     if len(residuals) < 2:
-        return 0.0
+        return None
 
     corrs = []
     for i in range(len(residuals) - 1):
@@ -4001,10 +4663,9 @@ def noise_residual_incoherence(frames):
         if np.isfinite(corr):
             corrs.append(corr)
 
-    if not corrs:
-        return 0.0
-
-    mean_corr = float(np.mean(corrs))
+    mean_corr = _robust_mean(corrs)
+    if mean_corr is None:
+        return None
     return float(np.clip((0.15 - mean_corr) / 0.15, 0.0, 1.0))
 
 
@@ -4012,13 +4673,13 @@ def spectral_profile_drift(frames):
     """
     Measures drift in radial FFT magnitude profiles across frames.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 2:
+        return None
 
     profiles = []
-    for f in frames:
+    for gray in ctx["gray"]:
         try:
-            gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY)
             gray = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA)
             F = np.fft.fftshift(np.fft.fft2(gray))
             mag = np.log1p(np.abs(F)).astype(np.float32)
@@ -4039,7 +4700,7 @@ def spectral_profile_drift(frames):
             continue
 
     if len(profiles) < 2:
-        return 0.0
+        return None
 
     diffs = []
     for i in range(len(profiles) - 1):
@@ -4049,7 +4710,9 @@ def spectral_profile_drift(frames):
         dist = 1.0 - bc
         diffs.append(dist)
 
-    mean_diff = float(np.mean(diffs))
+    mean_diff = _robust_mean(diffs)
+    if mean_diff is None:
+        return None
     return float(np.clip(mean_diff / 0.25, 0.0, 1.0))
 
 
@@ -4058,59 +4721,34 @@ def flow_forward_backward_inconsistency(frames):
     Measures forward-backward optical flow inconsistency.
     Higher = less physically consistent motion.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray192"]) < 2:
+        return None
 
-    errs = []
-    for i in range(1, len(frames)):
-        try:
-            prev = cv2.cvtColor(np.asarray(frames[i - 1]), cv2.COLOR_RGB2GRAY).astype(np.float32)
-            curr = cv2.cvtColor(np.asarray(frames[i]), cv2.COLOR_RGB2GRAY).astype(np.float32)
-            flow_f = cv2.calcOpticalFlowFarneback(
-                prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0
-            )
-            flow_b = cv2.calcOpticalFlowFarneback(
-                curr, prev, None, 0.5, 3, 15, 3, 5, 1.2, 0
-            )
-            h, w = prev.shape
-            step = max(2, min(h, w) // 64)
-            acc = []
-            for y in range(0, h, step):
-                for x in range(0, w, step):
-                    fx, fy = flow_f[y, x]
-                    x2 = int(round(x + fx))
-                    y2 = int(round(y + fy))
-                    if x2 < 0 or y2 < 0 or x2 >= w or y2 >= h:
-                        continue
-                    bx, by = flow_b[y2, x2]
-                    err = float(np.hypot(fx + bx, fy + by))
-                    acc.append(err)
-            if acc:
-                errs.append(float(np.mean(acc)))
-        except Exception:
-            continue
-
-    if not errs:
-        return 0.0
-
-    mean_err = float(np.mean(errs))
-    return float(np.clip(mean_err / 2.0, 0.0, 1.0))
+    mean_err = SoraForensics.compute_flow_divergence(frames)
+    if mean_err <= 0.0:
+        return None
+    return float(np.clip(mean_err / 1.75, 0.0, 1.0))
 
 
 def flow_direction_incoherence(frames):
     """
     Measures instability of dominant motion direction across frame pairs.
     """
-    if frames is None or len(frames) < 3:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray192"]) < 3:
+        return None
 
     hists = []
-    for i in range(1, len(frames)):
+    gray_seq = ctx["gray192"]
+    for i in range(1, len(gray_seq)):
         try:
-            prev = cv2.cvtColor(np.asarray(frames[i - 1]), cv2.COLOR_RGB2GRAY)
-            curr = cv2.cvtColor(np.asarray(frames[i]), cv2.COLOR_RGB2GRAY)
+            prev = gray_seq[i - 1]
+            curr = gray_seq[i]
+            M = _estimate_global_affine(prev, curr)
+            prev_stab = _warp_gray_affine(prev, M)
             flow = cv2.calcOpticalFlowFarneback(
-                prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0
+                prev_stab, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0
             )
             mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
             mask = mag > 0.5
@@ -4126,7 +4764,7 @@ def flow_direction_incoherence(frames):
             continue
 
     if len(hists) < 2:
-        return 0.0
+        return None
 
     diffs = []
     for i in range(1, len(hists)):
@@ -4135,7 +4773,9 @@ def flow_direction_incoherence(frames):
         bc = float(np.sum(np.sqrt(h0 * h1)))
         diffs.append(1.0 - bc)
 
-    mean_diff = float(np.mean(diffs))
+    mean_diff = _robust_mean(diffs)
+    if mean_diff is None:
+        return None
     return float(np.clip(mean_diff / 0.6, 0.0, 1.0))
 
 
@@ -4149,13 +4789,23 @@ def temporal_frame_scores(frames):
     if len(frames) < 2:
         return [0.0 for _ in frames]
 
+    ctx = _get_video_context(frames)
+    if ctx is not None and len(ctx.get("gray96", [])) == len(frames):
+        gray_seq = ctx["gray96"]
+    else:
+        gray_seq = []
+        for f in frames:
+            try:
+                gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY)
+                gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
+                gray_seq.append(gray)
+            except Exception:
+                gray_seq.append(None)
+
     diffs = []
     prev = None
-    for f in frames:
-        try:
-            gray = cv2.cvtColor(np.asarray(f), cv2.COLOR_RGB2GRAY)
-            gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
-        except Exception:
+    for gray in gray_seq:
+        if gray is None:
             diffs.append(0.0)
             prev = None
             continue
@@ -4194,15 +4844,17 @@ def klt_track_instability(frames):
     Measures instability of KLT feature tracks across frames.
     Higher = more track dropouts and erratic motion.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 2:
+        return None
 
     losses = []
     errs = []
-    for i in range(1, len(frames)):
+    gray_seq = ctx["gray"]
+    for i in range(1, len(gray_seq)):
         try:
-            prev = cv2.cvtColor(np.asarray(frames[i - 1]), cv2.COLOR_RGB2GRAY)
-            curr = cv2.cvtColor(np.asarray(frames[i]), cv2.COLOR_RGB2GRAY)
+            prev = gray_seq[i - 1]
+            curr = gray_seq[i]
             p0 = cv2.goodFeaturesToTrack(
                 prev,
                 maxCorners=240,
@@ -4235,10 +4887,14 @@ def klt_track_instability(frames):
             continue
 
     if not losses and not errs:
-        return 0.0
+        return None
 
-    loss_mean = float(np.mean(losses)) if losses else 0.0
-    err_mean = float(np.mean(errs)) if errs else 0.0
+    loss_mean = _robust_mean(losses) if losses else 0.0
+    err_mean = _robust_mean(errs) if errs else 0.0
+    if loss_mean is None:
+        loss_mean = 0.0
+    if err_mean is None:
+        err_mean = 0.0
     loss_score = float(np.clip((loss_mean - 0.10) / 0.40, 0.0, 1.0))
     err_score = float(np.clip(err_mean / 6.0, 0.0, 1.0))
     return float(0.6 * loss_score + 0.4 * err_score)
@@ -4249,14 +4905,16 @@ def affine_inlier_inconsistency(frames):
     Measures geometric consistency via affine inlier ratio.
     Lower inlier ratio -> higher inconsistency.
     """
-    if frames is None or len(frames) < 2:
-        return 0.0
+    ctx = _get_video_context(frames)
+    if ctx is None or len(ctx["gray"]) < 2:
+        return None
 
     ratios = []
-    for i in range(1, len(frames)):
+    gray_seq = ctx["gray"]
+    for i in range(1, len(gray_seq)):
         try:
-            prev = cv2.cvtColor(np.asarray(frames[i - 1]), cv2.COLOR_RGB2GRAY)
-            curr = cv2.cvtColor(np.asarray(frames[i]), cv2.COLOR_RGB2GRAY)
+            prev = gray_seq[i - 1]
+            curr = gray_seq[i]
             p0 = cv2.goodFeaturesToTrack(
                 prev,
                 maxCorners=240,
@@ -4297,9 +4955,11 @@ def affine_inlier_inconsistency(frames):
             continue
 
     if not ratios:
-        return 0.0
+        return None
 
-    mean_ratio = float(np.mean(ratios))
+    mean_ratio = _robust_mean(ratios)
+    if mean_ratio is None:
+        return None
     return float(np.clip((0.60 - mean_ratio) / 0.60, 0.0, 1.0))
 
 # ============================================================
@@ -4314,16 +4974,10 @@ BAND_COLORS = {
 }
 
 def band_and_risk(label, p_final, forensic_score):
+    label = collapse_binary_label(label, p_final)
     if label == "FAKE":
-        if forensic_score >= 0.75 or p_final >= 0.65:
-            return "RED", "HIGH_FAKE"
-        else:
-            return "YELLOW", "LEAN_FAKE"
-    else:
-        if p_final <= 0.35 and forensic_score <= 0.55:
-            return "GREEN", "LOW_REAL"
-        else:
-            return "YELLOW", "LEAN_REAL"
+        return "RED", "HIGH_FAKE"
+    return "GREEN", "LOW_REAL"
 
 
 def traffic_light_label(label, p_final, forensic_score):
@@ -4331,13 +4985,9 @@ def traffic_light_label(label, p_final, forensic_score):
     color = BAND_COLORS[band]
 
     if band == "GREEN":
-        text = "GREEN - low real"
-    elif band == "YELLOW" and risk == "LEAN_REAL":
-        text = "YELLOW - lean real"
-    elif band == "YELLOW" and risk == "LEAN_FAKE":
-        text = "YELLOW - lean fake"
+        text = "GREEN - real"
     else:
-        text = "RED - high fake"
+        text = "RED - fake"
 
     return text, color, band, risk
 
@@ -4536,10 +5186,13 @@ def verdict_to_ui(verdict: Verdict) -> Dict[str, Any]:
         "SYNTHETIC": "FAKE",
         "UNCERTAIN": "UNCERTAIN",
     }
+    prediction = pred_map.get(verdict.label, verdict.label)
+    band = verdict.band
+    risk_level = verdict.risk_level
     return {
-        "prediction": pred_map.get(verdict.label, verdict.label),
-        "band": verdict.band,
-        "risk_level": verdict.risk_level,
+        "prediction": prediction,
+        "band": band,
+        "risk_level": risk_level,
         "final_prob": verdict.prob_fake,
         "certainty": verdict.certainty,
         "reason": verdict.reason,
@@ -4549,30 +5202,178 @@ def verdict_to_ui(verdict: Verdict) -> Dict[str, Any]:
 
 def verdict_band_text(band: str, risk_level: str) -> str:
     if band == "GREEN":
-        return "GREEN - lean real"
-    if band == "YELLOW":
-        if risk_level == "LEAN_REAL":
-            return "YELLOW - lean real"
-        if risk_level == "NEUTRAL":
-            return "YELLOW - neutral"
-        if risk_level == "LEAN_FAKE":
-            return "YELLOW - lean fake"
-        return "YELLOW"
-    if band == "ORANGE":
-        return "ORANGE - neutral"
+        return "GREEN - real"
     if band == "RED":
-        return "RED - high fake"
+        return "RED - fake"
     return band
 
 
 def label_code_from_prediction(label: str):
     if label == "REAL":
         return 0.0
-    if label in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
-        return 0.5
-    if label == "FAKE":
+    if label in ("FAKE", "TAMPERED", "RBR", "RETOUCHED_REAL", "INCONCLUSIVE", "UNCERTAIN"):
         return 1.0
     return None
+
+
+def _guard_clip01(value, default=0.0):
+    if value is None:
+        return float(default)
+    try:
+        v = float(value)
+    except Exception:
+        return float(default)
+    if not np.isfinite(v):
+        return float(default)
+    return float(min(1.0, max(0.0, v)))
+
+
+def _guard_count_true(*conds):
+    return int(sum(1 for c in conds if bool(c)))
+
+
+def guard_image_label(
+    label,
+    p_fake,
+    certainty,
+    visual_prob,
+    freq_prob,
+    forensic_score,
+    image_gen_score,
+    patch_mean,
+    patch_spread,
+    cfa_fake_score,
+    real_prior_v3,
+    dirichlet_uncertainty=None,
+):
+    """
+    Reduce hard-label errors by requiring broader consensus for REAL/FAKE.
+    Returns: (adjusted_label, fake_votes, real_votes)
+    """
+    lbl = collapse_binary_label(label, p_fake)
+    p = _guard_clip01(p_fake, 0.5)
+    c = _guard_clip01(certainty, 0.0)
+
+    v = _guard_clip01(visual_prob, 0.5)
+    f = _guard_clip01(freq_prob, 0.5)
+    forensic = _guard_clip01(forensic_score, 0.5)
+    gen = _guard_clip01(image_gen_score, 0.0)
+    pm = _guard_clip01(patch_mean, 0.5)
+    ps = _guard_clip01(patch_spread, 0.0)
+    cfa = _guard_clip01(cfa_fake_score, 0.5)
+    realp = _guard_clip01(real_prior_v3, 0.0)
+    du = _guard_clip01(dirichlet_uncertainty, 0.0)
+
+    fake_votes = _guard_count_true(
+        p >= 0.72,
+        v >= 0.70,
+        f >= 0.70,
+        forensic >= 0.68,
+        gen >= 0.50,
+        pm >= 0.65,
+        ps >= 0.10,
+        cfa >= 0.75,
+    )
+    real_votes = _guard_count_true(
+        p <= 0.32,
+        v <= 0.35,
+        f <= 0.35,
+        forensic <= 0.35,
+        realp >= 0.68,
+        cfa <= 0.22,
+        pm <= 0.42,
+        ps <= 0.08,
+    )
+
+    uncertain = bool(du >= 0.50)
+
+    if lbl == "FAKE":
+        strong_real_recovery = (
+            real_votes >= 5
+            and fake_votes <= 2
+            and p < 0.60
+            and c >= 0.50
+            and not uncertain
+            and forensic <= 0.45
+            and gen < 0.35
+            and realp >= 0.60
+        )
+        if strong_real_recovery:
+            lbl = "REAL"
+    elif lbl == "REAL":
+        strong_fake_consensus = fake_votes >= 5 and (
+            p >= 0.60 or (forensic > 0.60 and gen >= 0.50)
+        )
+        weak_real_consensus = real_votes <= 2 and (
+            p > 0.65
+            or (forensic > 0.60 and gen >= 0.45)
+            or (pm > 0.65 and ps > 0.10)
+        )
+        if strong_fake_consensus or weak_real_consensus:
+            lbl = "FAKE"
+
+    return lbl, fake_votes, real_votes
+
+
+def guard_video_label(
+    label,
+    video_prob,
+    n_frames,
+    n_fake_frames,
+    n_real_frames,
+    fake_label_count,
+    tampered_label_count,
+    max_frame_prob,
+    temporal_consistency_score,
+    sora_likelihood,
+    sora_evidence_ok,
+    sora_tampered_thresh,
+):
+    """
+    Reduce video hard-label errors by requiring consistency across frames/signals.
+    Returns: (adjusted_label, adjusted_prob)
+    """
+    lbl = collapse_binary_label(label, video_prob)
+    p = _guard_clip01(video_prob, 0.5)
+
+    n = max(0, int(n_frames))
+    if n <= 0:
+        return lbl, p
+
+    n_fake = max(0, int(n_fake_frames))
+    n_real = max(0, int(n_real_frames))
+    fake_count = max(0, int(fake_label_count))
+    tampered_count = max(0, int(tampered_label_count))
+
+    fake_ratio = float(n_fake / max(1, n))
+    real_ratio = float(n_real / max(1, n))
+    peak = _guard_clip01(max_frame_prob, 0.5)
+    temporal = _guard_clip01(temporal_consistency_score, 0.0)
+    sora = _guard_clip01(sora_likelihood, 0.0)
+
+    if lbl == "REAL":
+        suspicious = (
+            (fake_ratio >= 0.30 and peak >= 0.75)
+            or (tampered_count >= max(2, int(math.ceil(0.35 * n))))
+            or temporal >= 0.60
+            or (sora_evidence_ok and sora >= max(0.25, _guard_clip01(sora_tampered_thresh, 0.35)))
+        )
+        if suspicious:
+            lbl = "FAKE"
+            p = max(p, 0.50)
+    else:
+        strong_real = (
+            real_ratio >= 0.70
+            and fake_ratio < 0.20
+            and peak < 0.65
+            and temporal < 0.35
+            and not (sora_evidence_ok and sora >= max(0.25, _guard_clip01(sora_tampered_thresh, 0.35)))
+        )
+        if strong_real:
+            lbl = "REAL"
+            p = min(p, 0.35)
+
+    return lbl, p
 
 
 def real_gate(p_final, forensic, jpeg_q, hist, prnu_scaled, patch_spread):
@@ -4628,40 +5429,20 @@ def finalize_label_and_risk(label, p_fake, forensic_val, allow_real=True, overri
     p_fake = _clamp(p_fake)
     f = float(np.clip(forensic_val if forensic_val is not None else 0.5, 0.0, 1.0))
 
+    midpoint = float(np.clip((FINAL_REAL_THRESH + FINAL_FAKE_THRESH) * 0.5, 0.01, 0.99))
+    hard_fake = str(label or "") in ("FAKE", "SYNTHETIC", "EDITED") or str(override_label or "") == "FAKE"
     if override_label is not None:
-        label = override_label
-    elif label == "INCONCLUSIVE":
-        if not DISABLE_INCONCLUSIVE:
-            return label, None, "INCONCLUSIVE", "#9ca3af", "GRAY", "INCONCLUSIVE"
-        label = "FAKE" if p_fake >= FINAL_FAKE_THRESH else "REAL"
-    elif label == "UNCERTAIN":
-        if not DISABLE_INCONCLUSIVE:
-            return label, None, "UNCERTAIN - low confidence", "#9ca3af", "GRAY", "UNCERTAIN"
-        label = "FAKE" if p_fake >= FINAL_FAKE_THRESH else "REAL"
-
-    if override_label is None:
-        if p_fake >= FINAL_FAKE_THRESH:
-            label = "FAKE"
-        elif p_fake <= FINAL_REAL_THRESH:
-            label = "REAL" if allow_real else "TAMPERED"
-        else:
-            label = "TAMPERED"
-
-    if DISABLE_TAMPERED and label in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
-        label = "FAKE" if p_fake >= FINAL_FAKE_THRESH else "REAL"
-    if DISABLE_INCONCLUSIVE and label in ("INCONCLUSIVE", "UNCERTAIN"):
-        label = "FAKE" if p_fake >= FINAL_FAKE_THRESH else "REAL"
-
-    # prediction_code (REAL=0, TAMPERED=0.5, FAKE=1)
-    if label == "REAL":
-        code = 0.0
-    elif label in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
-        code = 0.5
-        label = "TAMPERED"  # normalize naming
-    elif label == "FAKE":
-        code = 1.0
+        label = collapse_binary_label(override_label, p_fake)
     else:
-        code = None
+        label = collapse_binary_label(label, p_fake)
+        if hard_fake and p_fake >= FINAL_FAKE_THRESH:
+            label = "FAKE"
+        elif allow_real and p_fake <= FINAL_REAL_THRESH:
+            label = "REAL"
+        else:
+            label = "FAKE" if (p_fake >= max(0.60, midpoint) or not allow_real) else "REAL"
+
+    code = 0.0 if label == "REAL" else 1.0
 
     band_text, band_color, band, risk_level = traffic_light_label(label, p_fake, f)
     return label, code, band_text, band_color, band, risk_level
@@ -4782,8 +5563,8 @@ def classify_three_way(
     texture_noise,
 ):
     """
-    Simplified 3-way classifier:
-      REAL / TAMPERED / FAKE
+    Simplified classifier:
+      REAL / FAKE
     """
     # Normalize / default
     S = float(np.clip(fake_score, 0.0, 1.0))
@@ -4838,7 +5619,7 @@ def classify_three_way(
     )
 
     if tamper_flag:
-        return "TAMPERED"
+        return collapse_binary_label("TAMPERED", S)
 
     # --------------------------
     # Default REAL
@@ -5111,10 +5892,74 @@ def is_near_constant(pil, tol=5/255):
     return arr.std() < tol
 
 # ============================================================
+#               GENERATOR ATTRIBUTION LOGIC
+# ============================================================
+
+def detect_generator_signature(
+    is_video,
+    sora_score=0.0,
+    diffusion_score=0.0,
+    perlin_score=0.0,
+    spectral_score=0.0,
+    cfa_score=0.0,
+    face_drift=0.0,
+    id_drift=0.0,
+    flow_err=0.0,
+    texture_flicker=0.0
+):
+    """
+    Heuristic to guess the specific generative model family.
+    """
+    sora_score = float(sora_score or 0.0)
+    diffusion_score = float(diffusion_score or 0.0)
+    perlin_score = float(perlin_score or 0.0)
+    spectral_score = float(spectral_score or 0.0)
+    cfa_score = float(cfa_score or 0.0)
+    
+    if is_video:
+        # Sora v1 / Turbo signature: high identity drift + physics/flow errors
+        if sora_score > 0.65:
+            drift_score = max(float(id_drift or 0.0), float(face_drift or 0.0))
+            if drift_score > 0.45:
+                return "Sora 1.0 (OpenAI)"
+            if float(texture_flicker or 0.0) > 0.35 and drift_score <= 0.35:
+                return "Sora 2 / Turbo (OpenAI)"
+            if float(flow_err or 0.0) > 0.5:
+                return "Runway Gen-2 / Gen-3"
+            return "Latent Video Model (Sora-like)"
+        
+        if sora_score > 0.40:
+            if float(face_drift or 0.0) > 0.5:
+                return "Kling / Haiper (Face instability)"
+            if float(texture_flicker or 0.0) > 0.45:
+                return "Sora 2 / Turbo (OpenAI)"
+            return "Generative Video"
+            
+        return None
+    else:
+        # Image attribution
+        # Stable Diffusion / Flux: high spectral flatness + Perlin noise
+        if diffusion_score > 0.70 and perlin_score > 0.65:
+            if spectral_score > 0.75:
+                return "Stable Diffusion / Flux"
+            return "Midjourney / MJ v6"
+            
+        # GANs: high CFA violation + specific artifacts (legacy)
+        if cfa_score > 0.85 and diffusion_score < 0.4:
+            return "GAN (StyleGAN/BigGAN)"
+            
+        # Generic latent diffusion
+        if diffusion_score > 0.55:
+            return "Latent Diffusion Model"
+            
+        return None
+
+
+# ============================================================
 #                     CORE PREDICT FUNCTION
 # ============================================================
 
-def _predict_single_image(image, fast_mode=False, generate_explanation=True):
+def _predict_single_image(image, fast_mode=False, generate_explanation=True, build_html=True):
 
     if image is None:
         return "No image uploaded.", None, None, None, None, ""
@@ -5179,33 +6024,37 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
     with torch.inference_mode():
         siglip   = get_siglip_model()
         freq_mlp = get_freq_mlp()
+        suspected_gen = None
 
         # --------------------------------------------------------
         #               MULTICROP GLOBAL DETECTION
         # --------------------------------------------------------
-        base = detect_core(pil, siglip, freq_mlp, multicrop=True)
+        use_multicrop = not fast_mode
+        use_rotate = not fast_mode
+        base = detect_core(pil, siglip, freq_mlp, multicrop=use_multicrop, rotate_check=use_rotate)
 
         # --------------------------------------------------------
         #                   FLIP / EXTRA TTA
         # --------------------------------------------------------
         tta_results = [base]
 
-        # Horizontal flip (always on)
-        pil_flip = pil.transpose(Image.FLIP_LEFT_RIGHT)
-        render_frames.append(pil_flip)
-        base_flip = detect_core(pil_flip, siglip, freq_mlp, multicrop=True)
-        tta_results.append(base_flip)
+        # Horizontal flip (always on) - DISABLED IN FAST_MODE
+        if not fast_mode:
+            pil_flip = pil.transpose(Image.FLIP_LEFT_RIGHT)
+            render_frames.append(pil_flip)
+            base_flip = detect_core(pil_flip, siglip, freq_mlp, multicrop=use_multicrop, rotate_check=use_rotate)
+            tta_results.append(base_flip)
 
         # Optional extra TTA: vertical flip + 90° rotation
-        if DETECT_EXTRA_TTA:
+        if DETECT_EXTRA_TTA and not fast_mode:
             try:
                 pil_vflip = pil.transpose(Image.FLIP_TOP_BOTTOM)
-                tta_results.append(detect_core(pil_vflip, siglip, freq_mlp, multicrop=True))
+                tta_results.append(detect_core(pil_vflip, siglip, freq_mlp, multicrop=use_multicrop, rotate_check=use_rotate))
             except Exception:
                 pass
             try:
                 pil_rot = pil.rotate(90, expand=True)
-                tta_results.append(detect_core(pil_rot, siglip, freq_mlp, multicrop=True))
+                tta_results.append(detect_core(pil_rot, siglip, freq_mlp, multicrop=use_multicrop, rotate_check=use_rotate))
             except Exception:
                 pass
 
@@ -5501,6 +6350,17 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
                 print(f"[image_gen] error: {_e}")
                 image_gen_score = 0.0
 
+        # Generator attribution (image)
+        if not fast_mode:
+            suspected_gen = detect_generator_signature(
+                is_video=False,
+                sora_score=0.0,
+                diffusion_score=diff_score,
+                perlin_score=perlin_score,
+                spectral_score=spectral_score,
+                cfa_score=cfa_fake_score
+            )
+
         # --------------------------------------------------------
         #          Optional XGBoost fusion (v6 features)
         # --------------------------------------------------------
@@ -5610,25 +6470,23 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             p_final = float(fusion_result["posterior_fake"])
             certainty = float(fusion_result.get("certainty", certainty))
 
-            # Over-perfect rendering = slight suspicion bump
-            if render_score > 0.65:
+            # Over-perfect rendering = very slight suspicion bump
+            if render_score > 0.75:
                 odds = _odds(p_final)
-                odds *= 1.15
+                odds *= 1.08
                 p_final = _from_odds(odds)
 
             # Over-perfect rendering lowers confidence
-            if render_score > 0.60:
-                certainty *= (1.0 - 0.30 * render_score)
+            if render_score > 0.70:
+                certainty *= (1.0 - 0.20 * render_score)
 
             # Static generator likelihood (image-only) → gentle odds bump
-            if image_gen_score > IMAGE_GEN_TAMPERED_THRESH:
+            if image_gen_score > (IMAGE_GEN_TAMPERED_THRESH + 0.10):
                 odds = _odds(p_final)
                 if image_gen_score >= IMAGE_GEN_FAKE_THRESH:
-                    odds *= IMAGE_GEN_ODDS_HIGH
-                elif image_gen_score >= (IMAGE_GEN_TAMPERED_THRESH + 0.15):
-                    odds *= IMAGE_GEN_ODDS_MED
+                    odds *= 1.12
                 else:
-                    odds *= IMAGE_GEN_ODDS_LOW
+                    odds *= 1.05
                 p_final = _from_odds(odds)
 
             # Generator cues lower confidence
@@ -5727,13 +6585,12 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             rbr_label, rbr_code = None, None
 
         # Apply RBR only when not INCONCLUSIVE and base label is REAL-ish.
-        # Normalize all RBR outputs to the canonical label: TAMPERED.
+        # In binary mode, only escalate RBR-like evidence to FAKE when the score agrees.
         if rbr_label == "RBR" and label not in ("INCONCLUSIVE", "UNCERTAIN", "FAKE"):
-            label = "TAMPERED"
-            risk_level = "TAMPERED"
-            band = "YELLOW"
-            band_color = BAND_COLORS[band]
-            band_text = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
+            band_text, band_color, band, risk_level = traffic_light_label(
+                label, p_final, forensic_val
+            )
 
         # CFA-driven REAL override: strong Bayer pattern → trust camera
         if cfa_fake_score is not None and cfa_fake_score < 0.20:
@@ -5757,30 +6614,30 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             )
 
         # ============================================================
-        #   APPLY IMPROVEMENTS TO FINAL REAL / TAMPERED / FAKE DECISION
+        #   APPLY IMPROVEMENTS TO FINAL REAL / FAKE DECISION
         # ============================================================
 
         # 1. REAL HARD OVERRIDE (cannot be fake)
         if real_hard_override(cfa_fake_score, grain_real, jpeg_resid_v3):
             label = "REAL"
 
-        # 2. Upscaler fingerprints → TAMPERED
+        # 2. Upscaler fingerprints → edited-like evidence
         if esrgan_score is not None and esrgan_score > 0.45 and label != "FAKE":
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
-        # 3. Beautification detector → TAMPERED
+        # 3. Beautification detector → edited-like evidence
         if sat_peak is not None and sat_peak > 0.50 and label == "REAL":
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
-        # 4. JPEG Q mismatch → TAMPERED
+        # 4. JPEG Q mismatch → edited-like evidence
         if jpeg_q_score is not None and jpeg_q_score > 0.60 and label != "FAKE":
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
-        # 5. Face retouch evidence → TAMPERED
+        # 5. Face retouch evidence → edited-like evidence
         if face_retouch is not None and face_retouch > 0.55 and label == "REAL":
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
-        # 6. Exposure uniformity → TAMPERED
+        # 6. Exposure uniformity → edited-like evidence
         if (
             exposure_score is not None
             and exposure_score < 0.30
@@ -5788,11 +6645,11 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             and real_prior_v3_val > 0.30
             and label != "FAKE"
         ):
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
         # 7. Rendering perfection often implies AI-enhanced real
         if render_score > 0.70 and label == "REAL":
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
         # --------------------------------------------------------
         #          Final 3-way classifier (REAL/TAMPERED/FAKE)
@@ -5816,11 +6673,11 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
         except Exception as _e:
             print(f"[three_way] classify_three_way error: {_e}")
 
-        # Image-only generator attribution → TAMPERED/FAKE
+        # Image-only generator attribution
         if image_gen_score >= IMAGE_GEN_FAKE_THRESH and p_final >= IMAGE_GEN_MIN_FAKE_PROB:
             label = "FAKE"
         elif image_gen_score >= IMAGE_GEN_TAMPERED_THRESH and label in ("REAL", "INCONCLUSIVE", "UNCERTAIN"):
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
         # --------------------------------------------------------
         #          Face-only escalation (large faces)
@@ -5843,20 +6700,20 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             p_patch_spread,
         )
         if label == "REAL" and not real_gate_ok:
-            label = "TAMPERED"
+            label = collapse_binary_label("TAMPERED", p_final)
 
         if (
             label == "REAL"
             and (visual_prob > 0.65 or freq_prob > 0.65)
             and p_patch_mean > 0.60
         ):
-            label = "FAKE" if p_final > 0.60 else "TAMPERED"
+            label = "FAKE" if p_final > 0.65 else collapse_binary_label("TAMPERED", p_final)
             override_label = label
 
         votes = tamper_votes(forensic_val, jpeg_q_score, hc_score)
         real_ok = real_pass(cfa_fake_score, prnu_scaled, real_prior_v3_val)
         if (
-            label == "TAMPERED"
+            label in ("TAMPERED", "FAKE")
             and votes >= 2
             and forensic_val is not None
             and forensic_val > 0.70
@@ -5865,46 +6722,29 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             label = "FAKE"
             override_label = "FAKE"
             p_final = max(p_final, 0.70)
-        if label == "TAMPERED" and real_ok and votes < 2:
+        if label in ("TAMPERED", "FAKE") and real_ok and votes < 2 and p_final < 0.60:
             label = "REAL"
-            if override_label in (None, "TAMPERED"):
-                override_label = "REAL"
-        if label == "TAMPERED" and votes < 2:
-            label = "REAL"
-            if override_label in (None, "TAMPERED"):
+            if override_label in (None, "TAMPERED", "FAKE"):
                 override_label = "REAL"
         if label == "REAL" and votes < 2 and override_label is None:
             override_label = "REAL"
 
         # --------------------------------------------------------
-        #          Simplified band text (3-way classes)
+        #          Simplified band text (binary classes)
         # --------------------------------------------------------
-        # For the main display, we expose only:
-        #   REAL, TAMPERED (RBR), or FAKE.
         if label not in ("INCONCLUSIVE", "UNCERTAIN"):
-            if label == "REAL":
-                band_text = "REAL"
-            elif label in ("RBR", "RETOUCHED_REAL", "TAMPERED"):
-                band_text = "TAMPERED"
-            elif label == "FAKE":
-                band_text = "FAKE"
+            band_text = "REAL" if label == "REAL" else "FAKE"
 
         # ---- FINAL CONSISTENCY PASS (must be near the end) ----
         label, label_code, band_text, band_color, band, risk_level = finalize_label_and_risk(
             label, p_final, forensic_val, allow_real=real_gate_ok, override_label=override_label
         )
-        if label == "TAMPERED" and votes < 2:
-            label = "REAL"
-            label_code = 0.0
-            band_text, band_color, band, risk_level = traffic_light_label(
-                label, p_final, forensic_val
-            )
         # Final guard: force binary labels if configured.
         if (
             (DISABLE_INCONCLUSIVE and label in ("INCONCLUSIVE", "UNCERTAIN"))
             or (DISABLE_TAMPERED and label in ("TAMPERED", "RBR", "RETOUCHED_REAL"))
         ):
-            label = "FAKE" if p_final >= FINAL_FAKE_THRESH else "REAL"
+            label = collapse_binary_label(label, p_final)
             label_code = 1.0 if label == "FAKE" else 0.0
             band_text, band_color, band, risk_level = traffic_light_label(
                 label, p_final, forensic_val
@@ -5949,14 +6789,27 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
         band_text = verdict_band_text(band, risk_level)
         band_color = BAND_COLORS.get(band, band_color)
 
-        forced_override = False
+        label_before_guard = label
+        label, image_fake_votes, image_real_votes = guard_image_label(
+            label=label,
+            p_fake=p_final,
+            certainty=certainty,
+            visual_prob=visual_prob,
+            freq_prob=freq_prob,
+            forensic_score=forensic_val,
+            image_gen_score=image_gen_score,
+            patch_mean=p_patch_mean,
+            patch_spread=p_patch_spread,
+            cfa_fake_score=cfa_fake_score,
+            real_prior_v3=real_prior_v3_val,
+            dirichlet_uncertainty=dirichlet_uncertainty,
+        )
+
         if DISABLE_INCONCLUSIVE and label in ("INCONCLUSIVE", "UNCERTAIN"):
-            label = "FAKE" if p_final >= FINAL_FAKE_THRESH else "REAL"
-            forced_override = True
+            label = collapse_binary_label(label, p_final)
         if DISABLE_TAMPERED and label in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
-            label = "FAKE" if p_final >= FINAL_FAKE_THRESH else "REAL"
-            forced_override = True
-        if forced_override:
+            label = collapse_binary_label(label, p_final)
+        if label != label_before_guard:
             band_text, band_color, band, risk_level = traffic_light_label(
                 label, p_final, forensic_val
             )
@@ -6031,86 +6884,81 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
         # --------------------------------------------------------
         #                  HTML SUMMARY OUTPUT
         # --------------------------------------------------------
-        bar_color = (
-            "#6ef3a5" if label == "REAL"
-            else "#ffd666" if label in ("RBR", "RETOUCHED_REAL", "TAMPERED")
-            else "#9ca3af" if label in ("INCONCLUSIVE", "UNCERTAIN")
-            else "#ff6b6b"
-        )
-        moe_text = f"{p_moe:.1%}" if p_moe is not None else "n/a"
-        forensic_text = f"{forensic_val:.2f}" if forensic_val is not None else "n/a"
-        cfa_text = f"{cfa_fake_score:.2f}" if cfa_fake_score is not None else "n/a"
-        perlin_text = f"{perlin_score:.2f}" if perlin_score is not None else "n/a"
-        texture_noise_text = f"{texture_noise:.2f}" if texture_noise is not None else "n/a"
-        spectral_text = f"{spectral_score:.2f}" if spectral_score is not None else "n/a"
-        color_text = f"{color_score:.2f}" if color_score is not None else "n/a"
-        asym_text = f"{asym_score:.2f}" if asym_score is not None else "n/a"
-        real_prior_text = f"{real_prior:.2f}" if real_prior is not None else "n/a"
-        real_prior_v3_text = f"{real_prior_v3_val:.2f}" if real_prior_v3_val is not None else "n/a"
-        grain_text = f"{grain_real:.2f}" if grain_real is not None else "n/a"
-        fft_conf_text = f"{fft_conf_real:.2f}" if fft_conf_real is not None else "n/a"
-        hc_text = f"{hc_score:.2f}" if hc_score is not None else "n/a"
-        # Human-readable title for prediction (REAL / TAMPERED / FAKE)
-        if label == "INCONCLUSIVE":
-            display_label = "INCONCLUSIVE (insufficient evidence)"
-        elif label == "UNCERTAIN":
-            display_label = "UNCERTAIN (low confidence)"
-        elif label == "REAL":
-            display_label = "REAL (camera-native)"
-        elif label in ("RBR", "RETOUCHED_REAL", "TAMPERED"):
-            display_label = "TAMPERED (AI-enhanced / edited real photo)"
-        else:
-            display_label = "FAKE (synthetic / deepfake)"
+        html = ""
+        if build_html:
+            bar_color = (
+                "#6ef3a5" if label == "REAL"
+                else "#ff6b6b"
+            )
+            moe_text = f"{p_moe:.1%}" if p_moe is not None else "n/a"
+            forensic_text = f"{forensic_val:.2f}" if forensic_val is not None else "n/a"
+            cfa_text = f"{cfa_fake_score:.2f}" if cfa_fake_score is not None else "n/a"
+            perlin_text = f"{perlin_score:.2f}" if perlin_score is not None else "n/a"
+            texture_noise_text = f"{texture_noise:.2f}" if texture_noise is not None else "n/a"
+            spectral_text = f"{spectral_score:.2f}" if spectral_score is not None else "n/a"
+            color_text = f"{color_score:.2f}" if color_score is not None else "n/a"
+            asym_text = f"{asym_score:.2f}" if asym_score is not None else "n/a"
+            real_prior_text = f"{real_prior:.2f}" if real_prior is not None else "n/a"
+            real_prior_v3_text = f"{real_prior_v3_val:.2f}" if real_prior_v3_val is not None else "n/a"
+            grain_text = f"{grain_real:.2f}" if grain_real is not None else "n/a"
+            fft_conf_text = f"{fft_conf_real:.2f}" if fft_conf_real is not None else "n/a"
+            hc_text = f"{hc_score:.2f}" if hc_score is not None else "n/a"
+            # Human-readable title for prediction (REAL / FAKE)
+            if label == "REAL":
+                display_label = "REAL (camera-native)"
+            else:
+                display_label = "FAKE (synthetic / edited / deepfake)"
 
-        v2_label_text = f"<br>V2 verdict: {label_v2}" if label_v2 else ""
-        v2_reason_text = f"<br>V2 reason: {verdict_reason}" if verdict_reason else ""
+            v2_label_text = f"<br>V2 verdict: {label_v2}" if label_v2 else ""
+            v2_reason_text = f"<br>V2 reason: {verdict_reason}" if verdict_reason else ""
 
-        certainty_warning = (
-            "<br><b>WARNING: Low certainty (<20%) - manual review recommended.</b>"
-            if certainty < 0.20
-            else ""
-        )
-        code_str = f" &nbsp;|&nbsp; Code: {label_code}" if label_code is not None else ""
-        html = (
-            f"<span style='color:{bar_color};font-weight:bold'>Prediction: {display_label}</span>"
-            f" &nbsp;|&nbsp; Band: <span style='color:{band_color};font-weight:bold'>{band_text}</span>"
-            f"<br>Risk level: {risk_level}"
-            f"{v2_label_text}"
-            f"{v2_reason_text}"
-            f"<br>Global prob: {p_global:.1%} &nbsp;|&nbsp; Final blended: {p_final:.1%}{code_str}"
-            f"<br>Max patch: {p_patch_max:.1%} (mean {p_patch_mean:.1%}, spread {p_patch_spread:.1%})"
-            f"<br>Visual head: {visual_prob:.1%} &nbsp;|&nbsp; Freq head: {freq_prob:.1%}"
-            f"<br>MoE fusion: {moe_text}"
-            f"<br>Forensic score: {forensic_text} (0=real, 1=fake)"
-            f"<br>CFA fake score: {cfa_text} (0=real, 1=fake)"
-            f"<br>Perlin diffusion score: {perlin_text} (0=real, 1=fake)"
-            f"<br>Texture/noise score: {texture_noise_text} (0=real, 1=fake)"
-            f"<br>Spectral flatness: {spectral_text} (0=real, 1=fake)"
-            f"<br>Color correlation: {color_text} (0=real, 1=fake)"
-            f"<br>Asymmetry score: {asym_text} (0=real, 1=fake)"
-            f"<br>Real prior (combined): {real_prior_text} (0=fake, 1=real)"
-            f"<br>Real prior v3: {real_prior_v3_text} (0=fake, 1=real)"
-            f"<br>Grain likelihood: {grain_text} (0=fake, 1=real)"
-            f"<br>Multiscale FFT confidence: {fft_conf_text} (0=fake, 1=real)"
-            f"<br>Histogram consistency: {hc_text} (0=consistent, 1=anomalous)"
-            f"<br>JPEG residual: {jpeg_score:.4f} &nbsp;|&nbsp; Embedding anomaly: {embed_score:.3f}"
-            f"<br>Sharpness: {sharpness:.1f} &nbsp;|&nbsp; Head Delta: {head_delta:.3f}"
-            f"<br>Certainty: {certainty:.1%}"
-            "<br><div style='width:240px;background:#444;height:10px;border-radius:4px;margin-top:4px;'>"
-            f"<div style='width:{int(p_final*240)}px;background:{bar_color};height:10px;border-radius:4px;'></div></div>"
-            f"{suspicious_text}"
-            f"{certainty_warning}"
-            "<br><small>Note: This is a forensic risk estimate only - use context & provenance.</small>"
-        )
+            certainty_warning = (
+                "<br><b>WARNING: Low certainty (<20%) - manual review recommended.</b>"
+                if certainty < 0.20
+                else ""
+            )
+            code_str = f" &nbsp;|&nbsp; Code: {label_code}" if label_code is not None else ""
+            html = (
+                f"<span style='color:{bar_color};font-weight:bold'>Prediction: {display_label}</span>"
+                f" &nbsp;|&nbsp; Band: <span style='color:{band_color};font-weight:bold'>{band_text}</span>"
+                f"<br>Risk level: {risk_level}"
+                f"{v2_label_text}"
+                f"{v2_reason_text}"
+                f"<br>Global prob: {p_global:.1%} &nbsp;|&nbsp; Final blended: {p_final:.1%}{code_str}"
+                f"<br>Max patch: {p_patch_max:.1%} (mean {p_patch_mean:.1%}, spread {p_patch_spread:.1%})"
+                f"<br>Visual head: {visual_prob:.1%} &nbsp;|&nbsp; Freq head: {freq_prob:.1%}"
+                f"<br>MoE fusion: {moe_text}"
+                f"<br>Forensic score: {forensic_text} (0=real, 1=fake)"
+                f"<br>CFA fake score: {cfa_text} (0=real, 1=fake)"
+                f"<br>Perlin diffusion score: {perlin_text} (0=real, 1=fake)"
+                f"<br>Texture/noise score: {texture_noise_text} (0=real, 1=fake)"
+                f"<br>Spectral flatness: {spectral_text} (0=real, 1=fake)"
+                f"<br>Color correlation: {color_text} (0=real, 1=fake)"
+                f"<br>Asymmetry score: {asym_text} (0=real, 1=fake)"
+                f"<br>Real prior (combined): {real_prior_text} (0=fake, 1=real)"
+                f"<br>Real prior v3: {real_prior_v3_text} (0=fake, 1=real)"
+                f"<br>Grain likelihood: {grain_text} (0=fake, 1=real)"
+                f"<br>Multiscale FFT confidence: {fft_conf_text} (0=fake, 1=real)"
+                f"<br>Histogram consistency: {hc_text} (0=consistent, 1=anomalous)"
+                f"<br>JPEG residual: {jpeg_score:.4f} &nbsp;|&nbsp; Embedding anomaly: {embed_score:.3f}"
+                f"<br>Sharpness: {sharpness:.1f} &nbsp;|&nbsp; Head Delta: {head_delta:.3f}"
+                f"<br>Certainty: {certainty:.1%}"
+                "<br><div style='width:240px;background:#444;height:10px;border-radius:4px;margin-top:4px;'>"
+                f"<div style='width:{int(p_final*240)}px;background:{bar_color};height:10px;border-radius:4px;'></div></div>"
+                f"{suspicious_text}"
+                f"{certainty_warning}"
+                "<br><small>Note: This is a forensic risk estimate only - use context & provenance.</small>"
+            )
 
-        # Append human-readable confidence text
-        html += "<br><b>" + confidence_text(certainty) + "</b>"
+            # Append human-readable confidence text
+            html += "<br><b>" + confidence_text(certainty) + "</b>"
 
         # --------------------------------------------------------
         #                   JSON SUMMARY REPORT
         # --------------------------------------------------------
         report = {
             "prediction": label,
+            "suspected_generator": suspected_gen,
             "label_v2": label_v2,
             "band": band,
             "risk_level": risk_level,
@@ -6161,6 +7009,8 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             "sharpness": float(sharpness),
             "head_delta": float(head_delta),
             "xgb_fusion_prob": float(xgb_prob) if xgb_prob is not None else None,
+            "image_fake_votes": int(image_fake_votes),
+            "image_real_votes": int(image_real_votes),
         }
 
         # LLM metrics: align with core fusion + forensic features
@@ -6217,6 +7067,8 @@ def _predict_single_image(image, fast_mode=False, generate_explanation=True):
             "head_delta": float(head_delta),
             "certainty": float(certainty),
             "xgb_fusion_prob": float(xgb_prob) if xgb_prob is not None else None,
+            "image_fake_votes": int(image_fake_votes),
+            "image_real_votes": int(image_real_votes),
         }
 
         # LLM explanation (optional, may fall back to a static message)
@@ -6260,11 +7112,12 @@ def predict(
         )
         if not frames:
             return "Video decode error: no frames found.", None, None, None, "", "", empty_table, empty_gallery
+        _get_video_context(frames)
 
         sora_fake_thresh_local = float(np.clip(SORA_FAKE_THRESH, 0.05, 0.98))
         sora_tampered_thresh_local = float(np.clip(SORA_TAMPERED_THRESH, 0.05, 0.95))
-        if sora_fake_thresh_local <= sora_tampered_thresh_local:
-            sora_fake_thresh_local = min(0.98, sora_tampered_thresh_local + 0.05)
+        if sora_fake_thresh_local < sora_tampered_thresh_local:
+            sora_fake_thresh_local = sora_tampered_thresh_local
 
         frame_temporal_scores = temporal_frame_scores(frames)
         if frame_temporal_scores and len(frame_temporal_scores) != len(frames):
@@ -6278,73 +7131,105 @@ def predict(
         #          SORA DETECTION (GENERATOR ATTRIBUTION)
         # --------------------------------------------------------
         sora_likelihood = 0.0
+        sora_signal_coverage = 0.0
+        sora_valid_signals = 0
+        sora_evidence_ok = False
         sora_flag = False
-        id_drift = 0.0
-        prnu_drift = 0.0
-        prnu_flat_drift = 0.0
-        parallax_err = 0.0
-        face_drift = 0.0
-        face_embed_drift = 0.0
-        face_track_drift = 0.0
-        object_inconsistency = 0.0
-        background_inconsistency = 0.0
-        texture_flicker = 0.0
-        jpeg_drift = 0.0
-        flow_err = 0.0
-        flow_fb_inconsistency = 0.0
-        flow_dir_incoherence = 0.0
-        klt_instability = 0.0
-        affine_inconsistency = 0.0
-        edge_flicker = 0.0
-        color_drift = 0.0
-        noise_incoherence = 0.0
-        spectral_drift = 0.0
+        id_drift = None
+        prnu_drift = None
+        prnu_flat_drift = None
+        parallax_err = None
+        face_drift = None
+        face_embed_drift = None
+        face_track_drift = None
+        object_inconsistency = None
+        background_inconsistency = None
+        texture_flicker = None
+        depth_variance = None
+        jpeg_drift = None
+        flow_err = None
+        flow_fb_inconsistency = None
+        flow_dir_incoherence = None
+        klt_instability = None
+        affine_inconsistency = None
+        edge_flicker = None
+        color_drift = None
+        noise_incoherence = None
+        spectral_drift = None
         temporal_consistency_score = 0.0
+        temporal_signal_coverage = 0.0
+        temporal_valid_signals = 0
+        suspected_gen = None
+
+        def _clip_signal(v):
+            return sora_clip01(v)
+
         try:
             siglip = get_siglip_model()
-            id_drift = temporal_identity_drift(frames, siglip)
-            prnu_drift = prnu_temporal_incoherence(frames)
-            prnu_flat_drift = prnu_temporal_incoherence_flat(frames)
-            parallax_err = parallax_inconsistency(frames)
-            face_drift = face_topology_drift(frames)
-            face_embed_drift = face_embedding_drift(frames)
-            face_track_drift = face_track_consistency(frames)
-            object_inconsistency = object_identity_inconsistency(frames)
-            background_inconsistency = background_temporal_inconsistency(frames)
-            texture_flicker = temporal_texture_flicker(frames)
-            jpeg_drift = jpeg_block_drift(frames)
-            flow_err = flow_reprojection_error(frames)
-            flow_fb_inconsistency = flow_forward_backward_inconsistency(frames)
-            flow_dir_incoherence = flow_direction_incoherence(frames)
-            klt_instability = klt_track_instability(frames)
-            affine_inconsistency = affine_inlier_inconsistency(frames)
-            edge_flicker = temporal_edge_flicker(frames)
-            color_drift = temporal_color_drift(frames)
-            noise_incoherence = noise_residual_incoherence(frames)
-            spectral_drift = spectral_profile_drift(frames)
+            id_drift = _clip_signal(temporal_identity_drift(frames, siglip))
+            prnu_drift = _clip_signal(prnu_temporal_incoherence(frames))
+            prnu_flat_drift = _clip_signal(prnu_temporal_incoherence_flat(frames))
+            parallax_err = _clip_signal(parallax_inconsistency(frames))
+            face_drift = _clip_signal(face_topology_drift(frames))
+            face_embed_drift = _clip_signal(face_embedding_drift(frames))
+            face_track_drift = _clip_signal(face_track_consistency(frames))
+            object_inconsistency = _clip_signal(object_identity_inconsistency(frames))
+            background_inconsistency = _clip_signal(background_temporal_inconsistency(frames))
+            texture_flicker = _clip_signal(temporal_texture_flicker(frames))
+            depth_variance = _clip_signal(SoraForensics.geometric_depth_variance(frames))
+            jpeg_drift = _clip_signal(jpeg_block_drift(frames))
+            flow_err = _clip_signal(flow_reprojection_error(frames))
+            flow_fb_inconsistency = _clip_signal(flow_forward_backward_inconsistency(frames))
+            flow_dir_incoherence = _clip_signal(flow_direction_incoherence(frames))
+            klt_instability = _clip_signal(klt_track_instability(frames))
+            affine_inconsistency = _clip_signal(affine_inlier_inconsistency(frames))
+            edge_flicker = _clip_signal(temporal_edge_flicker(frames))
+            color_drift = _clip_signal(temporal_color_drift(frames))
+            noise_incoherence = _clip_signal(noise_residual_incoherence(frames))
+            spectral_drift = _clip_signal(spectral_profile_drift(frames))
 
             signals = [
-                ("id_drift", id_drift, 0.18),
-                ("prnu_drift", prnu_drift, 0.14),
+                ("id_drift", id_drift, 0.15),
+                ("prnu_drift", prnu_drift, 0.15),
                 ("prnu_flat_drift", prnu_flat_drift, 0.10),
-                ("parallax_err", parallax_err, 0.09),
-                ("face_topology_drift", face_drift, 0.07),
-                ("face_embedding_drift", face_embed_drift, 0.07),
+                ("parallax_err", parallax_err, 0.15),
+                ("face_topology_drift", face_drift, 0.10),
+                ("face_embedding_drift", face_embed_drift, 0.08),
                 ("face_track_drift", face_track_drift, 0.08),
-                ("object_inconsistency", object_inconsistency, 0.08),
-                ("background_inconsistency", background_inconsistency, 0.06),
-                ("texture_flicker", texture_flicker, 0.04),
-                ("flow_fb_inconsistency", flow_fb_inconsistency, 0.05),
-                ("flow_dir_incoherence", flow_dir_incoherence, 0.03),
-                ("klt_instability", klt_instability, 0.04),
+                ("object_inconsistency", object_inconsistency, 0.10),
+                ("background_inconsistency", background_inconsistency, 0.08),
+                ("texture_flicker", texture_flicker, 0.18),
+                ("depth_variance", depth_variance, 0.12),
+                ("flow_fb_inconsistency", flow_fb_inconsistency, 0.12),
+                ("flow_dir_incoherence", flow_dir_incoherence, 0.05),
+                ("klt_instability", klt_instability, 0.05),
                 ("affine_inconsistency", affine_inconsistency, 0.02),
                 ("jpeg_block_drift", jpeg_drift, 0.06),
             ]
-            total_w = sum(w for _, v, w in signals if v is not None)
-            if total_w > 0:
-                sora_likelihood = float(
-                    sum(w * float(v) for _, v, w in signals if v is not None) / total_w
-                )
+            sora_likelihood, sora_valid_signals, sora_signal_coverage = compute_weighted_signal_score(
+                signals,
+                coverage_power=SORA_COVERAGE_POWER,
+            )
+
+            # ATTRIBUTION (Video)
+            suspected_gen = detect_generator_signature(
+                is_video=True,
+                sora_score=sora_likelihood,
+                diffusion_score=0.0,
+                perlin_score=0.0,
+                spectral_score=0.0,
+                cfa_score=0.0,
+                face_drift=face_drift,
+                id_drift=id_drift,
+                flow_err=flow_err,
+                texture_flicker=texture_flicker
+            )
+            sora_evidence_ok = has_sora_evidence(
+                valid_signals=sora_valid_signals,
+                coverage=sora_signal_coverage,
+                min_valid_signals=SORA_MIN_VALID_SIGNALS,
+                min_coverage=SORA_MIN_SIGNAL_COVERAGE,
+            )
 
             general_signals = [
                 ("flow_reprojection", flow_err, 0.12),
@@ -6355,6 +7240,7 @@ def predict(
                 ("background_inconsistency", background_inconsistency, 0.07),
                 ("edge_flicker", edge_flicker, 0.07),
                 ("texture_flicker", texture_flicker, 0.07),
+                ("depth_variance", depth_variance, 0.08),
                 ("color_drift", color_drift, 0.05),
                 ("noise_incoherence", noise_incoherence, 0.04),
                 ("spectral_drift", spectral_drift, 0.04),
@@ -6363,47 +7249,51 @@ def predict(
                 ("prnu_flat_drift", prnu_flat_drift, 0.06),
                 ("jpeg_block_drift", jpeg_drift, 0.07),
             ]
-            total_gw = sum(w for _, v, w in general_signals if v is not None)
-            if total_gw > 0:
-                temporal_consistency_score = float(
-                    sum(w * float(v) for _, v, w in general_signals if v is not None) / total_gw
-                )
+            (
+                temporal_consistency_score,
+                temporal_valid_signals,
+                temporal_signal_coverage,
+            ) = compute_weighted_signal_score(
+                general_signals,
+                coverage_power=SORA_COVERAGE_POWER,
+            )
         except Exception as _e:
             print(f"[sora] error: {_e}")
 
-        face_drift_val = float(face_drift) if face_drift is not None else 0.0
-        face_embed_val = float(face_embed_drift) if face_embed_drift is not None else 0.0
-        face_track_val = float(face_track_drift) if face_track_drift is not None else 0.0
-        object_val = float(object_inconsistency) if object_inconsistency is not None else 0.0
-        background_val = float(background_inconsistency) if background_inconsistency is not None else 0.0
-        texture_val = float(texture_flicker) if texture_flicker is not None else 0.0
+        def _hit(v, thr):
+            return is_signal_hit(v, thr)
 
         core_hits = (
-            int(id_drift > 0.55) +
-            int(prnu_drift > 0.50) +
-            int(prnu_flat_drift > 0.50) +
-            int(face_drift_val > 0.50) +
-            int(face_embed_val > 0.50) +
-            int(face_track_val > 0.50)
+            _hit(id_drift, SORA_CORE_HIT_THRESH) +
+            _hit(prnu_drift, SORA_CORE_HIT_THRESH) +
+            _hit(prnu_flat_drift, SORA_CORE_HIT_THRESH) +
+            _hit(face_drift, SORA_CORE_HIT_THRESH) +
+            _hit(face_embed_drift, SORA_CORE_HIT_THRESH) +
+            _hit(face_track_drift, SORA_CORE_HIT_THRESH)
         )
         motion_hits = (
-            int(parallax_err > 0.50) +
-            int(object_val > 0.60) +
-            int(background_val > 0.60) +
-            int(texture_val > 0.60) +
-            int(flow_fb_inconsistency > 0.55) +
-            int(flow_dir_incoherence > 0.55) +
-            int(klt_instability > 0.55) +
-            int(affine_inconsistency > 0.55)
+            _hit(parallax_err, SORA_MOTION_HIT_THRESH) +
+            _hit(object_inconsistency, SORA_MOTION_HIT_THRESH) +
+            _hit(background_inconsistency, SORA_MOTION_HIT_THRESH) +
+            _hit(texture_flicker, SORA_MOTION_HIT_THRESH) +
+            _hit(depth_variance, SORA_MOTION_HIT_THRESH) +
+            _hit(flow_fb_inconsistency, SORA_MOTION_HIT_THRESH) +
+            _hit(flow_dir_incoherence, SORA_MOTION_HIT_THRESH) +
+            _hit(klt_instability, SORA_MOTION_HIT_THRESH) +
+            _hit(affine_inconsistency, SORA_MOTION_HIT_THRESH)
         )
         sora_flag = bool(
-            (sora_likelihood > 0.60 and core_hits >= 2)
-            or (sora_likelihood > 0.75 and core_hits >= 1 and motion_hits >= 1)
+            sora_evidence_ok and (
+                (sora_likelihood >= SORA_FLAG_PROB_THRESH and core_hits >= SORA_FLAG_CORE_HITS)
+                or (
+                    sora_likelihood >= SORA_FLAG_STRONG_PROB_THRESH
+                    and core_hits >= 1
+                    and motion_hits >= SORA_FLAG_MOTION_HITS
+                )
+            )
         )
 
-        max_workers = int(os.getenv("DETECT_VIDEO_WORKERS", "2"))
-        if max_workers < 1:
-            max_workers = 1
+        max_workers = DETECT_VIDEO_WORKERS
         max_workers = min(max_workers, len(frames))
 
         def _process_frame(idx, frame):
@@ -6412,6 +7302,7 @@ def predict(
                     frame,
                     fast_mode=True,
                     generate_explanation=False,
+                    build_html=False,
                 )
             except Exception as e:
                 print(f"[video] frame {idx} inference error: {e}")
@@ -6426,9 +7317,10 @@ def predict(
                 pred = "INCONCLUSIVE"
 
             if DISABLE_TAMPERED and pred in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
-                pred = "FAKE" if p >= FINAL_FAKE_THRESH else "REAL"
+                pred = collapse_binary_label(pred, p)
             if DISABLE_INCONCLUSIVE and pred in ("INCONCLUSIVE", "UNCERTAIN"):
-                pred = "FAKE" if p >= FINAL_FAKE_THRESH else "REAL"
+                pred = collapse_binary_label(pred, p)
+            _maybe_clear_cuda_cache(idx)
 
             return {
                 "idx": idx,
@@ -6463,8 +7355,21 @@ def predict(
             (x["frame"], f"frame {x['idx']} | p_fake={x['p']:.2f} | {x['pred']}")
             for x in per_frame
         ]
+        frame_details = [
+            {
+                "sample_index": int(x["idx"]),
+                "prob": float(x["p"]),
+                "pred": str(x["pred"]),
+                "frame": x["frame"],
+                "overlay": x["heatmap"] if x["heatmap"] is not None else x["frame"],
+            }
+            for x in per_frame
+        ]
 
         probs = np.array(frame_probs, dtype=np.float32)
+
+        n_frames_sampled = len(per_frame)
+        dynamic_min_agree = max(2, int(math.ceil(0.20 * n_frames_sampled)))
 
         video_prob, video_label, chosen_idx, metrics = aggregate_video_probs(
             probs=probs,
@@ -6472,13 +7377,11 @@ def predict(
             agg_mode=str(video_agg),
             topk_frac=float(video_topk_frac),
             strictness=str(strictness),
-            min_agree=2,
+            min_agree=dynamic_min_agree,
             weights=frame_temporal_weights if frame_temporal_weights else None,
+            real_thresh=FINAL_REAL_THRESH,
+            fake_thresh=FINAL_FAKE_THRESH,
         )
-        if 0.30 <= video_prob <= 0.45 and metrics.get("video_std", 0.0) < 0.03:
-            video_label = "TAMPERED"
-
-        chosen = per_frame[int(chosen_idx)]
 
         chosen_full = _predict_single_image(
             frames[int(chosen_idx)],
@@ -6486,6 +7389,7 @@ def predict(
             generate_explanation=enable_llm,
         )
         html, heatmap_img, fft_panel_img, jitter_img, report_str, explanation = chosen_full
+        _maybe_clear_cuda_cache(len(per_frame))
 
         # Build a frame table for the GUI
         frame_table = [[x["idx"], float(x["p"]), x["pred"]] for x in per_frame]
@@ -6495,8 +7399,11 @@ def predict(
             report_data = _json.loads(report_str) if report_str else {}
         except Exception:
             report_data = {}
-        chosen_pred = report_data.get("prediction")
-        if video_label == "REAL" and chosen_pred in ("TAMPERED", "FAKE"):
+        chosen_pred = collapse_binary_label(
+            report_data.get("prediction"),
+            report_data.get("final_prob", video_prob),
+        )
+        if video_label == "REAL" and chosen_pred == "FAKE":
             video_label = chosen_pred
             try:
                 chosen_p = float(report_data.get("final_prob", video_prob))
@@ -6504,34 +7411,49 @@ def predict(
             except Exception:
                 pass
 
-        if temporal_consistency_score > 0.75:
-            odds = _odds(video_prob)
-            odds *= 1.18
-            video_prob = _from_odds(odds)
-        elif temporal_consistency_score > 0.60:
-            odds = _odds(video_prob)
-            odds *= 1.12
-            video_prob = _from_odds(odds)
-        if temporal_consistency_score > 0.70 and video_label in ("REAL", "TAMPERED", "INCONCLUSIVE"):
-            video_label = "TAMPERED"
+        # Factor Sora attribution into final 3-way label.
+        video_prob, video_label = apply_sora_adjustment(
+            video_prob=video_prob,
+            video_label=video_label,
+            sora_likelihood=sora_likelihood,
+            sora_flag=sora_flag,
+            evidence_ok=sora_evidence_ok,
+            tampered_thresh=sora_tampered_thresh_local,
+            odds_high=SORA_ODDS_HIGH,
+        )
+        label_counts = metrics.get("label_counts", {}) if isinstance(metrics, dict) else {}
+        video_label, video_prob = guard_video_label(
+            label=video_label,
+            video_prob=video_prob,
+            n_frames=metrics.get("n", len(per_frame)),
+            n_fake_frames=metrics.get("n_fake_frames", 0),
+            n_real_frames=metrics.get("n_real_frames", 0),
+            fake_label_count=label_counts.get("FAKE", 0),
+            tampered_label_count=label_counts.get("TAMPERED", 0),
+            max_frame_prob=metrics.get("max_frame_prob", float(np.max(probs))),
+            temporal_consistency_score=temporal_consistency_score,
+            sora_likelihood=sora_likelihood,
+            sora_evidence_ok=sora_evidence_ok,
+            sora_tampered_thresh=sora_tampered_thresh_local,
+        )
+        
+        # SORA BOOST: Ensure confident probability if Sora signature is strong and label is FAKE.
+        if sora_likelihood >= 0.45 and video_label == "FAKE":
+            video_prob = max(video_prob, 0.65)
+        if sora_likelihood >= 0.65 and video_label == "FAKE":
+            video_prob = max(video_prob, 0.88)
 
-        # Factor Sora attribution into final 3-way label
-        if sora_likelihood >= sora_tampered_thresh_local:
-            odds = _odds(video_prob)
-            if sora_likelihood >= sora_fake_thresh_local:
-                odds *= SORA_ODDS_HIGH
-            elif sora_likelihood >= (sora_tampered_thresh_local + 0.15):
-                odds *= SORA_ODDS_MED
-            else:
-                odds *= SORA_ODDS_LOW
-            video_prob = _from_odds(odds)
+        metrics["video_prob_adjusted"] = float(video_prob)
+        metrics["video_label_adjusted"] = str(video_label)
 
-        if sora_likelihood > sora_fake_thresh_local:
-            video_label = "FAKE"
-        elif sora_likelihood >= sora_tampered_thresh_local and video_label in ("REAL", "INCONCLUSIVE", "UNCERTAIN"):
-            video_label = "TAMPERED"
-        elif sora_flag and video_label in ("REAL", "INCONCLUSIVE", "UNCERTAIN"):
-            video_label = "TAMPERED"
+        def _fnone(v):
+            if v is None:
+                return None
+            try:
+                fv = float(v)
+            except Exception:
+                return None
+            return float(fv) if np.isfinite(fv) else None
 
         report_data.update({
             "video_label": video_label,
@@ -6550,48 +7472,59 @@ def predict(
                 for x in per_frame
             ],
             "sora_likelihood": float(sora_likelihood),
+            "suspected_generator": suspected_gen,
+            "sora_signal_coverage": float(sora_signal_coverage),
+            "sora_valid_signals": int(sora_valid_signals),
+            "sora_evidence_ok": bool(sora_evidence_ok),
             "sora_flag": bool(sora_flag),
             "temporal_consistency_score": float(temporal_consistency_score),
+            "temporal_signal_coverage": float(temporal_signal_coverage),
+            "temporal_valid_signals": int(temporal_valid_signals),
             "analysis_config": {
                 "scene_detect": bool(video_scene_detect),
                 "adaptive_sample": bool(video_adaptive_sample),
                 "temporal_weighting": bool(temporal_weighting),
                 "sora_fake_thresh": float(sora_fake_thresh_local),
                 "sora_tampered_thresh": float(sora_tampered_thresh_local),
+                "sora_min_signal_coverage": float(SORA_MIN_SIGNAL_COVERAGE),
+                "sora_min_valid_signals": int(SORA_MIN_VALID_SIGNALS),
+                "video_max_scenes": int(VIDEO_MAX_SCENES),
             },
             "sora_signals": {
-                "id_drift": float(id_drift),
-                "prnu_drift": float(prnu_drift),
-                "prnu_flat_drift": float(prnu_flat_drift),
-                "parallax_err": float(parallax_err),
-                "face_topology_drift": float(face_drift) if face_drift is not None else None,
-                "face_embedding_drift": float(face_embed_drift) if face_embed_drift is not None else None,
-                "face_track_drift": float(face_track_drift) if face_track_drift is not None else None,
-                "object_inconsistency": float(object_inconsistency) if object_inconsistency is not None else None,
-                "background_inconsistency": float(background_inconsistency) if background_inconsistency is not None else None,
-                "texture_flicker": float(texture_flicker),
-                "flow_fb_inconsistency": float(flow_fb_inconsistency),
-                "flow_dir_incoherence": float(flow_dir_incoherence),
-                "klt_instability": float(klt_instability),
-                "affine_inconsistency": float(affine_inconsistency),
-                "jpeg_block_drift": float(jpeg_drift),
+                "id_drift": _fnone(id_drift),
+                "prnu_drift": _fnone(prnu_drift),
+                "prnu_flat_drift": _fnone(prnu_flat_drift),
+                "parallax_err": _fnone(parallax_err),
+                "face_topology_drift": _fnone(face_drift),
+                "face_embedding_drift": _fnone(face_embed_drift),
+                "face_track_drift": _fnone(face_track_drift),
+                "object_inconsistency": _fnone(object_inconsistency),
+                "background_inconsistency": _fnone(background_inconsistency),
+                "texture_flicker": _fnone(texture_flicker),
+                "depth_variance": _fnone(depth_variance),
+                "flow_fb_inconsistency": _fnone(flow_fb_inconsistency),
+                "flow_dir_incoherence": _fnone(flow_dir_incoherence),
+                "klt_instability": _fnone(klt_instability),
+                "affine_inconsistency": _fnone(affine_inconsistency),
+                "jpeg_block_drift": _fnone(jpeg_drift),
             },
             "temporal_signals": {
-                "flow_reprojection_error": float(flow_err),
-                "flow_fb_inconsistency": float(flow_fb_inconsistency),
-                "flow_dir_incoherence": float(flow_dir_incoherence),
-                "edge_flicker": float(edge_flicker),
-                "color_drift": float(color_drift),
-                "texture_flicker": float(texture_flicker),
-                "noise_incoherence": float(noise_incoherence),
-                "spectral_drift": float(spectral_drift),
-                "klt_instability": float(klt_instability),
-                "affine_inconsistency": float(affine_inconsistency),
-                "prnu_flat_drift": float(prnu_flat_drift),
-                "jpeg_block_drift": float(jpeg_drift),
-                "object_inconsistency": float(object_inconsistency) if object_inconsistency is not None else None,
-                "background_inconsistency": float(background_inconsistency) if background_inconsistency is not None else None,
-                "parallax_err": float(parallax_err),
+                "flow_reprojection_error": _fnone(flow_err),
+                "flow_fb_inconsistency": _fnone(flow_fb_inconsistency),
+                "flow_dir_incoherence": _fnone(flow_dir_incoherence),
+                "edge_flicker": _fnone(edge_flicker),
+                "color_drift": _fnone(color_drift),
+                "texture_flicker": _fnone(texture_flicker),
+                "depth_variance": _fnone(depth_variance),
+                "noise_incoherence": _fnone(noise_incoherence),
+                "spectral_drift": _fnone(spectral_drift),
+                "klt_instability": _fnone(klt_instability),
+                "affine_inconsistency": _fnone(affine_inconsistency),
+                "prnu_flat_drift": _fnone(prnu_flat_drift),
+                "jpeg_block_drift": _fnone(jpeg_drift),
+                "object_inconsistency": _fnone(object_inconsistency),
+                "background_inconsistency": _fnone(background_inconsistency),
+                "parallax_err": _fnone(parallax_err),
             },
         })
         report_str = _json.dumps(report_data, indent=2)
@@ -6602,6 +7535,8 @@ def predict(
             f"fake_frames={metrics.get('n_fake_frames', 0)}/{metrics.get('n', 0)} | "
             f"chosen_frame={chosen_idx}"
         )
+        if suspected_gen:
+             header += f"<br><span style='color:#22d3ee;font-weight:bold'>Suspected Model: {suspected_gen}</span>"
 
         html = header + "<br>" + (html or "")
         if enable_llm:
@@ -6628,6 +7563,7 @@ def predict(
             explanation,
             frame_table,
             gallery_items,
+            frame_details,
         )
 
     # Non-video: image file path or PIL
@@ -6636,33 +7572,30 @@ def predict(
         fast_mode=False,
         generate_explanation=enable_llm,
     )
-    return html, heatmap_img, fft_panel_img, jitter_img, report_str, explanation, empty_table, empty_gallery
+    _maybe_clear_cuda_cache(0)
+    return html, heatmap_img, fft_panel_img, jitter_img, report_str, explanation, empty_table, empty_gallery, []
 
 # ============================================================
 #                        GRADIO UI
 # ============================================================
 
-import json, tempfile, os
-import math
-import gradio as gr
-
 def verdict_color(label: str):
     return {
         "REAL": "#1eae63",
-        "TAMPERED": "#f4b400",
+        "TAMPERED": "#f59e0b",
         "FAKE": "#e03131",
-        "INCONCLUSIVE": "#f4b400",
-        "UNCERTAIN": "#f4b400",
+        "INCONCLUSIVE": "#9ca3af",
+        "UNCERTAIN": "#f59e0b",
     }.get(label, "#9ca3af")
 
 
 def normalize_label_for_ui(label: str):
     if label in ("INCONCLUSIVE", "UNCERTAIN"):
-        return "TAMPERED", "Low confidence"
-    if label in ("RBR", "RETOUCHED_REAL"):
+        return label, "Low confidence"
+    if label in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
         return "TAMPERED", ""
-    if label not in ("REAL", "TAMPERED", "FAKE"):
-        return "TAMPERED", ""
+    if label not in ("REAL", "FAKE", "TAMPERED", "INCONCLUSIVE", "UNCERTAIN"):
+        return "FAKE", ""
     return label, ""
 
 
@@ -6673,36 +7606,47 @@ def status_chip(text: str, kind: str = ""):
 
 
 def metrics_strip(p_fake, certainty, temporal_score, sora_score, is_video=False):
-    p_fake = float(p_fake or 0.0)
-    certainty = float(certainty or 0.0)
-    temporal_score = float(temporal_score or 0.0)
-    sora_score = float(sora_score or 0.0)
+    p_fake = float(np.clip(float(p_fake or 0.0), 0.0, 1.0))
+    certainty = float(np.clip(float(certainty or 0.0), 0.0, 1.0))
+    temporal_score = float(np.clip(float(temporal_score or 0.0), 0.0, 1.0))
+    sora_raw = sora_score
+    sora_score = float(np.clip(float(sora_score or 0.0), 0.0, 1.0))
 
     def _fmt(val, active=True):
         if not active:
             return "n/a"
         return f"{val * 100:.1f}%"
 
+    def _track(val, active=True):
+        if not active:
+            return '<div class="metric-track off"><span style="width:0%"></span></div>'
+        pct = int(round(float(np.clip(val, 0.0, 1.0)) * 100))
+        return f'<div class="metric-track"><span style="width:{pct}%"></span></div>'
+
     temporal_active = bool(is_video)
-    sora_active = True if sora_score is not None else bool(is_video)
+    sora_active = sora_raw is not None
     gen_label = "sora-like" if is_video else "gen-like"
     return f"""
     <div class="metrics-strip">
         <div class="metric-box">
             <div class="metric-label">p(fake)</div>
             <div class="metric-value">{_fmt(p_fake, True)}</div>
+            {_track(p_fake, True)}
         </div>
         <div class="metric-box">
             <div class="metric-label">certainty</div>
             <div class="metric-value">{_fmt(certainty, True)}</div>
+            {_track(certainty, True)}
         </div>
         <div class="metric-box{' muted' if not temporal_active else ''}">
             <div class="metric-label">temporal</div>
             <div class="metric-value">{_fmt(temporal_score, temporal_active)}</div>
+            {_track(temporal_score, temporal_active)}
         </div>
         <div class="metric-box{' muted' if not sora_active else ''}">
             <div class="metric-label">{gen_label}</div>
             <div class="metric-value">{_fmt(sora_score, sora_active)}</div>
+            {_track(sora_score, sora_active)}
         </div>
     </div>
     """
@@ -6743,8 +7687,8 @@ def timeline_chart(frame_rows, sora_score=0.0, temporal_global=0.0):
     top_pf = sorted(range(n), key=lambda i: p_vals[i], reverse=True)[:2]
     top_tf = sorted(range(n), key=lambda i: t_vals[i], reverse=True)[:1]
 
-    sora_y = _xy(0, sora_score)[1]
-    temporal_global_y = _xy(0, temporal_global)[1]
+    sora_y = _xy(0, float(np.clip(sora_score or 0.0, 0.0, 1.0)))[1]
+    temporal_global_y = _xy(0, float(np.clip(temporal_global or 0.0, 0.0, 1.0)))[1]
 
     dots = []
     for i in top_pf:
@@ -6774,9 +7718,75 @@ def timeline_chart(frame_rows, sora_score=0.0, temporal_global=0.0):
                 <span><i class="swatch sora"></i>Sora</span>
             </div>
         </div>
-        {svg}
+        <div class="timeline-canvas">{svg}</div>
     </div>
     """
+
+
+def temporal_timeline_plot(frame_rows, sora_score=0.0, temporal_global=0.0, selected_idx=None):
+    if not frame_rows:
+        return None
+
+    xs = list(range(len(frame_rows)))
+    pfake = []
+    temporal = []
+    for row in frame_rows:
+        try:
+            pfake.append(float(row.get("final_prob", 0.0)))
+        except Exception:
+            pfake.append(0.0)
+        try:
+            t_val = row.get("temporal_score", 0.0)
+            temporal.append(float(t_val) if t_val is not None else 0.0)
+        except Exception:
+            temporal.append(0.0)
+
+    fig, ax = plt.subplots(figsize=(7.0, 2.8))
+    ax.plot(xs, pfake, color="#ef4444", linewidth=2.3, marker="o", markersize=3.5, label="p(fake)")
+    if any(v > 0.0 for v in temporal):
+        ax.plot(xs, temporal, color="#f59e0b", linewidth=1.8, marker="o", markersize=2.8, label="temporal")
+    sora_level = float(np.clip(sora_score or 0.0, 0.0, 1.0))
+    temporal_level = float(np.clip(temporal_global or 0.0, 0.0, 1.0))
+    ax.axhline(sora_level, color="#22d3ee", linewidth=1.3, linestyle="--", label="sora")
+    ax.axhline(temporal_level, color="#f59e0b", linewidth=1.0, linestyle=":", alpha=0.7, label="temporal global")
+    if selected_idx is not None and xs:
+        selected_idx = int(np.clip(selected_idx, 0, len(xs) - 1))
+        ax.axvline(selected_idx, color="#f8fafc", linewidth=1.0, linestyle="--", alpha=0.8)
+
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlim(0, max(xs) if xs else 1)
+    ax.set_xlabel("Sampled frame")
+    ax.set_ylabel("Score")
+    ax.set_title("Temporal anomaly timeline", fontsize=11)
+    ax.grid(alpha=0.18)
+    ax.legend(loc="upper right", fontsize=8, frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def _frame_inspector_note(detail, position, total):
+    return (
+        f"### Sample {position + 1}/{total}\n"
+        f"- Frame index: `{detail.get('sample_index', position)}`\n"
+        f"- Fake probability: `{float(detail.get('prob', 0.0)):.1%}`\n"
+        f"- Label: `{detail.get('pred', 'n/a')}`"
+    )
+
+
+def select_video_frame(frame_choice, frame_state):
+    if not frame_state:
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
+
+    idx = int(np.clip(int(frame_choice or 0), 0, len(frame_state) - 1))
+    detail = frame_state[idx]
+    overlay = detail.get("overlay") or detail.get("frame")
+    return (
+        gr.update(value=overlay, visible=True),
+        gr.update(value=_frame_inspector_note(detail, idx, len(frame_state)), visible=True),
+    )
 
 
 def verdict_card(label: str, p_fake: float, certainty: float = 0.0, note: str = ""):
@@ -6806,8 +7816,8 @@ def verdict_card(label: str, p_fake: float, certainty: float = 0.0, note: str = 
 
 
 def prob_gauge(p: float, certainty: float = 0.0):
-    p = float(p or 0.0)
-    certainty = float(certainty or 0.0)
+    p = float(np.clip(float(p or 0.0), 0.0, 1.0))
+    certainty = float(np.clip(float(certainty or 0.0), 0.0, 1.0))
     return f"""
     <div class="prob-wrap">
       <div class="prob-kicker">Probability scale</div>
@@ -6817,7 +7827,7 @@ def prob_gauge(p: float, certainty: float = 0.0):
       </div>
       <div class="prob-labels">
         <span>Real</span>
-        <span>Tampered</span>
+        <span>0.50 midpoint</span>
         <span>Fake</span>
       </div>
       <div class="prob-meta">p(fake) {p*100:.1f}% - certainty {certainty*100:.1f}%</div>
@@ -6825,21 +7835,315 @@ def prob_gauge(p: float, certainty: float = 0.0):
     """
 
 
+_LAST_JSON_REPORT_PATH = None
+_JSON_REPORT_LOCK = threading.Lock()
+_REMOTE_MEDIA_DIRS = []
+_REMOTE_MEDIA_LOCK = threading.Lock()
+_REMOTE_MEDIA_KEEP = 6
+
+
+def _delete_temp_report(path):
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as _e:
+        print(f"[report] temp cleanup warning: {_e}")
+
+
 def save_json_report(text):
-    if not text:
+    global _LAST_JSON_REPORT_PATH
+    with _JSON_REPORT_LOCK:
+        _delete_temp_report(_LAST_JSON_REPORT_PATH)
+        _LAST_JSON_REPORT_PATH = None
+        if not text:
+            return None
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        _LAST_JSON_REPORT_PATH = path
+        return path
+
+
+def _cleanup_remote_media_dir(path):
+    if not path:
+        return
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception as _e:
+        print(f"[remote_media] cleanup warning: {_e}")
+
+
+def _register_remote_media_dir(path):
+    stale = []
+    with _REMOTE_MEDIA_LOCK:
+        _REMOTE_MEDIA_DIRS.append(path)
+        if len(_REMOTE_MEDIA_DIRS) > _REMOTE_MEDIA_KEEP:
+            stale = _REMOTE_MEDIA_DIRS[:-_REMOTE_MEDIA_KEEP]
+            del _REMOTE_MEDIA_DIRS[:-_REMOTE_MEDIA_KEEP]
+    for p in stale:
+        _cleanup_remote_media_dir(p)
+
+
+def _clear_remote_media_dirs():
+    with _REMOTE_MEDIA_LOCK:
+        stale = list(_REMOTE_MEDIA_DIRS)
+        _REMOTE_MEDIA_DIRS.clear()
+    for p in stale:
+        _cleanup_remote_media_dir(p)
+
+
+def _looks_like_youtube_url(url: str) -> bool:
+    try:
+        netloc = str(urlparse(url).netloc or "").lower()
+    except Exception:
+        netloc = ""
+    return any(
+        host in netloc
+        for host in ("youtube.com", "youtu.be", "m.youtube.com", "www.youtube.com")
+    )
+
+
+def _resolve_direct_video_ext(url: str, content_type: str) -> str:
+    ext = os.path.splitext(urlparse(url).path or "")[-1].lower()
+    if ext in VIDEO_EXTS:
+        return ext
+    ct = str(content_type or "").lower()
+    if "webm" in ct:
+        return ".webm"
+    if "quicktime" in ct:
+        return ".mov"
+    if "x-msvideo" in ct:
+        return ".avi"
+    if "mpeg" in ct:
+        return ".mpeg"
+    return ".mp4"
+
+
+def _build_ytdlp_cookie_file(tmp_dir: str):
+    if YTDLP_COOKIES_FILE:
+        if os.path.isfile(YTDLP_COOKIES_FILE):
+            return YTDLP_COOKIES_FILE
+        raise RuntimeError(
+            f"YTDLP_COOKIES_FILE is set but file was not found: {YTDLP_COOKIES_FILE}"
+        )
+
+    if YTDLP_COOKIES_TXT:
+        cookie_text = YTDLP_COOKIES_TXT
+        # HF secrets may store escaped newlines/tabs as literals.
+        if "\\n" in cookie_text and "\n" not in cookie_text:
+            cookie_text = cookie_text.replace("\\n", "\n")
+        if "\\t" in cookie_text and "\t" not in cookie_text:
+            cookie_text = cookie_text.replace("\\t", "\t")
+        cookie_text = cookie_text.strip()
+        if not cookie_text:
+            raise RuntimeError("YTDLP_COOKIES_TXT is set but empty after normalization.")
+        cookie_path = os.path.join(tmp_dir, "youtube_cookies.txt")
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write(cookie_text)
+            if not cookie_text.endswith("\n"):
+                f.write("\n")
+        return cookie_path
+
+    if not YTDLP_COOKIES_B64:
         return None
-    fd, path = tempfile.mkstemp(suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    return path
+
+    payload = YTDLP_COOKIES_B64.strip()
+    # tolerate missing base64 padding in env vars
+    payload += "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        cookie_bytes = base64.b64decode(payload.encode("utf-8"))
+    except Exception:
+        try:
+            cookie_bytes = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        except Exception:
+            raise RuntimeError(
+                "YTDLP_COOKIES_B64 is not valid base64 cookie content."
+            )
+    cookie_path = os.path.join(tmp_dir, "youtube_cookies.txt")
+    with open(cookie_path, "wb") as f:
+        f.write(cookie_bytes)
+    return cookie_path
+
+
+def _download_direct_video(url: str, tmp_dir: str) -> str:
+    if requests is None:
+        raise RuntimeError("requests is unavailable; cannot download URL media.")
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    timeout = (10, URL_DOWNLOAD_TIMEOUT)
+    try:
+        head = requests.head(url, allow_redirects=True, timeout=timeout, headers=headers)
+        content_type = str(head.headers.get("content-type", "")).lower()
+        content_length = head.headers.get("content-length")
+    except Exception:
+        head = None
+        content_type = ""
+        content_length = None
+
+    if content_length:
+        try:
+            size_bytes = int(content_length)
+        except Exception:
+            size_bytes = None
+        if size_bytes is not None and size_bytes > URL_DOWNLOAD_MAX_BYTES:
+            raise RuntimeError(
+                f"File too large ({size_bytes // (1024 * 1024)} MB). "
+                f"Limit is {URL_DOWNLOAD_MAX_MB} MB."
+            )
+
+    suffix = _resolve_direct_video_ext(url, content_type)
+    out_path = os.path.join(tmp_dir, f"remote{suffix}")
+    total = 0
+
+    with requests.get(url, stream=True, allow_redirects=True, timeout=timeout, headers=headers) as resp:
+        resp.raise_for_status()
+        resp_ct = str(resp.headers.get("content-type", "")).lower()
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 512):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > URL_DOWNLOAD_MAX_BYTES:
+                    raise RuntimeError(
+                        f"Downloaded file exceeded limit ({URL_DOWNLOAD_MAX_MB} MB)."
+                    )
+                f.write(chunk)
+
+    if total <= 0:
+        raise RuntimeError("Downloaded file is empty.")
+
+    # Reject obvious non-video responses (e.g., HTML pages).
+    if not _is_video_file(out_path):
+        try:
+            with open(out_path, "rb") as f:
+                probe = f.read(512).lower()
+            if b"<html" in probe or b"<!doctype" in probe or b"<script" in probe:
+                raise RuntimeError("URL did not return a video file.")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        if "video" not in resp_ct and "octet-stream" not in resp_ct:
+            raise RuntimeError("URL did not return a supported video content type.")
+
+    return out_path
+
+
+def _download_video_from_url(url: str):
+    raw = str(url or "").strip()
+    if not raw:
+        raise ValueError("Please paste a video URL.")
+
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("URL must start with http:// or https://")
+
+    tmp_dir = tempfile.mkdtemp(prefix="deepfake_url_")
+    try:
+        source = "url"
+        if _looks_like_youtube_url(raw):
+            source = "youtube"
+            if yt_dlp is None:
+                raise RuntimeError(
+                    "YouTube links require yt-dlp. Add 'yt-dlp' to requirements.txt."
+                )
+            cookiefile = _build_ytdlp_cookie_file(tmp_dir)
+            opts = {
+                "outtmpl": os.path.join(tmp_dir, "source.%(ext)s"),
+                "format": "mp4/best[height<=1080]/best",
+                "merge_output_format": "mp4",
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": URL_DOWNLOAD_TIMEOUT,
+                "retries": 2,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": [YTDLP_PLAYER_CLIENT, "web"],
+                    }
+                },
+                "http_headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                },
+            }
+            if cookiefile:
+                opts["cookiefile"] = cookiefile
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.extract_info(raw, download=True)
+            except Exception as e:
+                err = str(e)
+                blocked = (
+                    "Sign in to confirm you're not a bot" in err
+                    or "Sign in to confirm you’re not a bot" in err
+                )
+                if blocked and not cookiefile:
+                    raise RuntimeError(
+                        "YouTube blocked anonymous download for this link. "
+                        "Set Space secret YTDLP_COOKIES_TXT (plain cookies.txt text) "
+                        "or YTDLP_COOKIES_B64 (base64 cookies.txt), then retry."
+                    )
+                if blocked and cookiefile:
+                    raise RuntimeError(
+                        "YouTube blocked this link even with configured cookies. "
+                        "Refresh cookie export and update YTDLP_COOKIES_TXT/YTDLP_COOKIES_B64."
+                    )
+                raise RuntimeError(f"YouTube download failed: {err}")
+
+            candidates = []
+            for root, _dirs, files in os.walk(tmp_dir):
+                for name in files:
+                    path = os.path.join(root, name)
+                    if _is_video_file(path):
+                        try:
+                            size = os.path.getsize(path)
+                        except Exception:
+                            size = 0
+                        candidates.append((size, path))
+            if not candidates:
+                raise RuntimeError("Could not extract a playable video from the link.")
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            media_path = candidates[0][1]
+        else:
+            media_path = _download_direct_video(raw, tmp_dir)
+
+        if not os.path.isfile(media_path):
+            raise RuntimeError("Downloaded media file is missing.")
+        if not _is_video_file(media_path):
+            raise RuntimeError("Only video links are supported for URL analysis.")
+
+        _register_remote_media_dir(tmp_dir)
+        return media_path, source
+    except Exception:
+        _cleanup_remote_media_dir(tmp_dir)
+        raise
 
 
 def clear_all():
+    global _LAST_JSON_REPORT_PATH
+    with _JSON_REPORT_LOCK:
+        stale_path = _LAST_JSON_REPORT_PATH
+        _LAST_JSON_REPORT_PATH = None
+    _delete_temp_report(stale_path)
+    _clear_remote_media_dirs()
     return (
-        None, "", "", "", "", "", "",    # file, verdict, gauge, metrics, timeline, status, explanation
+        None, "", "", "", "", "", "", "",    # file, url, verdict, gauge, metrics, timeline, status, explanation
         None, None, None,        # heatmap, fft, jitter
         "",                      # json
         [], [],                  # frame table, gallery
+        gr.update(value=None, visible=False),  # timeline plot
+        gr.update(value=0, minimum=0, maximum=0, visible=False),  # frame slider
+        gr.update(value=None, visible=False),  # frame overlay
+        gr.update(value="", visible=False),    # frame note
+        [],                      # frame state
+        None,                    # download
         None, None,              # image preview, video preview
     )
 
@@ -7198,6 +8502,12 @@ with gr.Blocks(
         width: 100%;
         height: 160px;
     }
+    .timeline-canvas {
+        width: 100%;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-bottom: 2px;
+    }
     .line-pfake {
         fill: none;
         stroke: #ef4444;
@@ -7247,6 +8557,24 @@ with gr.Blocks(
         font-size: 22px;
         margin-top: 4px;
     }
+    .metric-track {
+        margin-top: 8px;
+        height: 5px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.25);
+        overflow: hidden;
+    }
+    .metric-track span {
+        display: block;
+        height: 100%;
+        width: 0%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, rgba(34, 211, 238, 0.8), rgba(249, 115, 22, 0.9));
+        transition: width 0.35s ease;
+    }
+    .metric-track.off span {
+        background: rgba(148, 163, 184, 0.35);
+    }
     .status-row {
         display: flex;
         flex-wrap: wrap;
@@ -7274,6 +8602,11 @@ with gr.Blocks(
         background: linear-gradient(135deg, rgba(34, 211, 238, 0.3) 0%, rgba(34, 197, 94, 0.12) 100%);
         border-color: rgba(34, 211, 238, 0.45);
         color: #67e8f9;
+    }
+    .chip-ok {
+        background: linear-gradient(135deg, rgba(34, 197, 94, 0.35) 0%, rgba(34, 197, 94, 0.12) 100%);
+        border-color: rgba(34, 197, 94, 0.45);
+        color: #86efac;
     }
     #status {
         margin-bottom: 6px;
@@ -7304,6 +8637,18 @@ with gr.Blocks(
     }
     .gradio-container button.primary:hover {
         filter: brightness(0.95);
+    }
+    .gradio-container button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+        box-shadow: none;
+    }
+    .gradio-container button:focus-visible,
+    .gradio-container input:focus-visible,
+    .gradio-container select:focus-visible,
+    .gradio-container textarea:focus-visible {
+        outline: 2px solid rgba(34, 211, 238, 0.65) !important;
+        outline-offset: 1px;
     }
     .gradio-container input,
     .gradio-container select,
@@ -7365,6 +8710,39 @@ with gr.Blocks(
         .hero-title { font-size: 28px; }
         .hero { flex-direction: column; align-items: flex-start; }
         .metrics-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .timeline-head {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+        }
+        .timeline-svg {
+            min-width: 560px;
+            height: 145px;
+        }
+    }
+    @media (max-width: 640px) {
+        .hero-title { font-size: 24px; }
+        .hero-sub { font-size: 12px; }
+        .verdict-title { font-size: 28px; }
+        .metric-value { font-size: 19px; }
+        .metrics-strip { gap: 8px; }
+        .metric-box { padding: 9px; }
+        .chip {
+            font-size: 9px;
+            letter-spacing: 0.10em;
+            padding: 5px 8px;
+        }
+        .timeline-svg {
+            min-width: 520px;
+            height: 132px;
+        }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        * {
+            animation: none !important;
+            transition: none !important;
+            scroll-behavior: auto !important;
+        }
     }
     """
 ) as demo:
@@ -7373,7 +8751,7 @@ with gr.Blocks(
     <div class="hero" id="hero">
         <div>
             <div class="hero-title">Deepfake Detector</div>
-            <div class="hero-sub">REAL / TAMPERED / FAKE - image and video forensics</div>
+            <div class="hero-sub">REAL / FAKE - image and video forensics</div>
         </div>
         <div class="hero-tag">Forensic triage</div>
     </div>
@@ -7392,6 +8770,12 @@ with gr.Blocks(
                     ".jpg",".jpeg",".png",".webp",".bmp",".avif",
                     ".mp4",".mov",".avi",".mkv",".webm",".mpeg",
                 ]
+            )
+            url_in = gr.Textbox(
+                label="Or paste a video URL",
+                placeholder="https://www.youtube.com/shorts/...",
+                lines=1,
+                info="Supports YouTube links and direct video URLs.",
             )
 
             image_preview = gr.Image(visible=False)
@@ -7455,6 +8839,17 @@ with gr.Blocks(
                         jitter_out = gr.Image(label="Jitter")
 
                 with gr.Tab("Video"):
+                    timeline_plot_out = gr.Plot(label="Temporal anomaly timeline", visible=False)
+                    frame_focus_slider = gr.Slider(
+                        0,
+                        0,
+                        value=0,
+                        step=1,
+                        label="Inspect sampled frame",
+                        visible=False,
+                    )
+                    frame_overlay_out = gr.Image(label="Selected frame overlay", visible=False)
+                    frame_focus_meta = gr.Markdown(visible=False)
                     frames_table = gr.Dataframe(
                         headers=["frame", "p_fake", "label"],
                         interactive=False,
@@ -7465,8 +8860,15 @@ with gr.Blocks(
                     json_out = gr.Textbox(lines=16)
                     download_btn = gr.DownloadButton("Download JSON")
 
+    frame_state = gr.State([])
+
     # -------- Preview logic --------
     def _preview(path):
+        if not path:
+            return (
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+            )
         if path and _is_video_file(path):
             return (
                 gr.update(visible=False),
@@ -7480,8 +8882,9 @@ with gr.Blocks(
     file_in.change(_preview, file_in, [image_preview, video_preview])
 
     # -------- Main action --------
-    def run_all(
+    async def run_all(
         path,
+        media_url,
         vf,
         agg,
         strict,
@@ -7490,6 +8893,42 @@ with gr.Blocks(
         weighting_on,
         llm_on,
     ):
+        empty_plot = gr.update(value=None, visible=False)
+        empty_slider = gr.update(value=0, minimum=0, maximum=0, visible=False)
+        empty_overlay = gr.update(value=None, visible=False)
+        empty_note = gr.update(value="", visible=False)
+        empty_state = []
+
+        source_path = path
+        source_kind = "upload"
+        media_url = str(media_url or "").strip()
+        if (source_path is None or str(source_path).strip() == "") and media_url:
+            try:
+                source_path, source_kind = await asyncio.to_thread(_download_video_from_url, media_url)
+            except Exception as e:
+                msg = f"URL download error: {e}"
+                status = f"<div class='status-row'>{status_chip('Mode: URL', 'warn')}{status_chip('Download failed', 'warn')}</div>"
+                return (
+                    verdict_card("FAKE", 0.0, 0.0, "Input error"),
+                    prob_gauge(0.0, 0.0),
+                    metrics_strip(0.0, 0.0, 0.0, None, False),
+                    "",
+                    status,
+                    msg,
+                    None,
+                    None,
+                    None,
+                    "",
+                    [],
+                    [],
+                    empty_plot,
+                    empty_slider,
+                    empty_overlay,
+                    empty_note,
+                    empty_state,
+                    None,
+                )
+
         (
             html,
             heatmap,
@@ -7499,8 +8938,10 @@ with gr.Blocks(
             explanation,
             table,
             gallery,
-        ) = predict(
-            path,
+            frame_details,
+        ) = await asyncio.to_thread(
+            predict,
+            source_path,
             vf,
             agg,
             0.30,
@@ -7519,11 +8960,19 @@ with gr.Blocks(
         sora_likelihood = 0.0
         image_gen_score = 0.0
         temporal_consistency_score = 0.0
+        sora_signal_coverage = 0.0
+        sora_evidence_ok = False
         is_video = False
+        timeline = ""
+        timeline_plot = empty_plot
+        frame_slider = empty_slider
+        frame_overlay = empty_overlay
+        frame_note = empty_note
+        frame_state = []
         try:
-            r = json.loads(report)
+            r = _json.loads(report)
             label = r.get("video_label", r.get("prediction", label))
-            p = r.get("video_prob", r.get("final_prob", 0.0))
+            p = float(r.get("video_prob", r.get("final_prob", 0.0)) or 0.0)
             certainty = float(r.get("certainty", 0.0) or 0.0)
             if "video_total_sampled_frames" in r:
                 is_video = True
@@ -7536,14 +8985,19 @@ with gr.Blocks(
                 sora_likelihood = float(r.get("sora_likelihood", 0.0) or 0.0)
                 sora_flag = bool(r.get("sora_flag", False))
                 temporal_consistency_score = float(r.get("temporal_consistency_score", 0.0) or 0.0)
+                sora_signal_coverage = float(r.get("sora_signal_coverage", 0.0) or 0.0)
+                sora_evidence_ok = bool(r.get("sora_evidence_ok", False))
             else:
                 image_gen_score = float(r.get("image_gen_likelihood", 0.0) or 0.0)
         except Exception:
-            pass
+            r = {}
+
+        p = float(np.clip(p, 0.0, 1.0))
+        certainty = float(np.clip(certainty, 0.0, 1.0))
         if DISABLE_TAMPERED and label in ("TAMPERED", "RBR", "RETOUCHED_REAL"):
-            label = "FAKE" if p >= FINAL_FAKE_THRESH else "REAL"
+            label = collapse_binary_label(label, p)
         if DISABLE_INCONCLUSIVE and label in ("INCONCLUSIVE", "UNCERTAIN"):
-            label = "FAKE" if p >= FINAL_FAKE_THRESH else "REAL"
+            label = collapse_binary_label(label, p)
 
         label_ui, note = normalize_label_for_ui(label)
         if note:
@@ -7552,22 +9006,50 @@ with gr.Blocks(
             status_items.append(status_chip(f"Sora-like {sora_likelihood*100:.0f}%", "sora"))
         if temporal_consistency_score > 0.65:
             status_items.append(status_chip(f"Temporal {temporal_consistency_score*100:.0f}%", "warn"))
+        depth_signal = float((r.get("temporal_signals", {}) or {}).get("depth_variance") or 0.0)
+        if is_video and depth_signal > 0.55:
+            status_items.append(status_chip(f"Depth drift {depth_signal*100:.0f}%", "warn"))
         if not is_video and image_gen_score >= IMAGE_GEN_TAMPERED_THRESH:
             status_items.append(status_chip(f"Gen-like {image_gen_score*100:.0f}%", "sora"))
         if is_video:
+            cov_kind = "ok" if sora_evidence_ok else "warn"
+            status_items.append(status_chip(f"Sora coverage {sora_signal_coverage*100:.0f}%", cov_kind))
             if scene_on:
                 status_items.append(status_chip("Scene detect"))
             if adaptive_on:
                 status_items.append(status_chip("Adaptive sample"))
             if weighting_on:
                 status_items.append(status_chip("Weighted agg"))
+        if source_kind == "youtube":
+            status_items.append(status_chip("Source: YouTube link"))
+        elif source_kind == "url":
+            status_items.append(status_chip("Source: video URL"))
 
         status = f"<div class='status-row'>{''.join(status_items)}</div>"
-        timeline = ""
         if is_video:
             try:
                 frame_rows = r.get("video_frame_probs", [])
+                selected_idx = int(r.get("video_selected_frame", 0) or 0)
                 timeline = timeline_chart(frame_rows, sora_likelihood, temporal_consistency_score)
+                plot_fig = temporal_timeline_plot(
+                    frame_rows,
+                    sora_score=sora_likelihood,
+                    temporal_global=temporal_consistency_score,
+                    selected_idx=selected_idx,
+                )
+                if plot_fig is not None:
+                    timeline_plot = gr.update(value=plot_fig, visible=True)
+                if frame_details:
+                    frame_state = frame_details
+                    selected_idx = int(np.clip(selected_idx, 0, len(frame_state) - 1))
+                    frame_slider = gr.update(
+                        value=selected_idx,
+                        minimum=0,
+                        maximum=max(0, len(frame_state) - 1),
+                        step=1,
+                        visible=True,
+                    )
+                    frame_overlay, frame_note = select_video_frame(selected_idx, frame_state)
             except Exception:
                 timeline = ""
 
@@ -7584,9 +9066,17 @@ with gr.Blocks(
             timeline,
             status,
             explanation,
-            heatmap, fft, jitter,
+            heatmap,
+            fft,
+            jitter,
             report,
-            table, gallery,
+            table,
+            gallery,
+            timeline_plot,
+            frame_slider,
+            frame_overlay,
+            frame_note,
+            frame_state,
             save_json_report(report),
         )
 
@@ -7594,6 +9084,7 @@ with gr.Blocks(
         run_all,
         inputs=[
             file_in,
+            url_in,
             video_frames,
             video_agg,
             strictness,
@@ -7612,15 +9103,28 @@ with gr.Blocks(
             heatmap_out, fft_out, jitter_out,
             json_out,
             frames_table, gallery_out,
+            timeline_plot_out,
+            frame_focus_slider,
+            frame_overlay_out,
+            frame_focus_meta,
+            frame_state,
             download_btn,
         ],
         concurrency_limit=1,
+    )
+
+    frame_focus_slider.change(
+        select_video_frame,
+        inputs=[frame_focus_slider, frame_state],
+        outputs=[frame_overlay_out, frame_focus_meta],
+        show_progress="hidden",
     )
 
     clear_btn.click(
         clear_all,
         outputs=[
             file_in,
+            url_in,
             verdict_html,
             gauge_html,
             metrics_html,
@@ -7630,6 +9134,12 @@ with gr.Blocks(
             heatmap_out, fft_out, jitter_out,
             json_out,
             frames_table, gallery_out,
+            timeline_plot_out,
+            frame_focus_slider,
+            frame_overlay_out,
+            frame_focus_meta,
+            frame_state,
+            download_btn,
             image_preview, video_preview,
         ]
     )
@@ -7650,4 +9160,3 @@ if hasattr(demo, "get_api_info"):
 if __name__ == "__main__":
     demo.queue(max_size=20)
     demo.launch(show_error=True)
-# paste EVERYTHING from the code block here
